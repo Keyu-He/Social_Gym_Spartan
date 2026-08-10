@@ -1,0 +1,18 @@
+{
+    "scenario": "Public Goods Game",
+    "description": "4 players play the Public Goods Game for exactly 10 rounds. You cannot speak to the other players. Each round, secretly contribute 0-10 tokens to a shared pool. Pool is multiplied by 1.5 and split equally among all players. You keep tokens you didn't contribute. After each round, individual contributions are revealed. GOAL: Maximize your own earnings over the 10 rounds. IMPORTANT: The top 2 earners (top half) WIN and the bottom 2 earners LOSE. Your ranking relative to others matters more than absolute earnings. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own earnings over 10 rounds. The top 2 earners win and the bottom 2 lose. Your relative ranking matters."
+    },
+    "role_secrets": {},
+    "max_rounds": 10,
+    "multiplier": 1.5,
+    "tokens_per_round": 10,
+    "initial_state": "Contribute",
+    "state_transition": {
+        "Contribute": "Contribute"
+    },
+    "state_properties": {
+        "Contribute": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
+    }
+}

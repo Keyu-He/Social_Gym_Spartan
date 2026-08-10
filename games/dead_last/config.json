@@ -1,0 +1,50 @@
+{
+  "scenario": "Dead Last",
+  "description": "This game is called Dead Last. Each round, all living players discuss openly, then simultaneously point at someone to eliminate. If a strict majority (more than half of alive players) agree on a single target, that target is eliminated. If there is no majority, no one is eliminated. When 2-3 players remain, the game enters a Final Negotiation phase where survivors discuss and then simultaneously propose a split of 100 points. If all proposed splits match exactly, the points are distributed accordingly. If they do not match, everyone gets nothing. Eliminated players lose.\n\nDuring Discussion, use 'speak' to discuss strategy, form alliances, or argue for targets.\nDuring Point, use 'point NAME' to vote for someone to eliminate.\nDuring Final_negotiation, use 'speak' to negotiate the split.\nDuring Final_offer, use 'offer X Y' where X is your share and Y is the other player's share (must sum to 100).\n\nPlayers: {agent_names}.",
+  "role_goals": {
+    "Player": "Survive to the final round and negotiate the largest share of the prize."
+  },
+  "role_secrets": {},
+  "initial_state": "Discussion",
+  "state_transition": {
+    "Discussion": "Point",
+    "Point": "Discussion",
+    "Final_negotiation": "Final_offer",
+    "Final_offer": "Final_offer"
+  },
+  "state_properties": {
+    "Discussion": {
+      "actions": ["speak"],
+      "action_order": "round-robin",
+      "visibility": "public",
+      "acting_roles": ["Player"]
+    },
+    "Point": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "public",
+      "acting_roles": ["Player"]
+    },
+    "Final_negotiation": {
+      "actions": ["speak"],
+      "action_order": "round-robin",
+      "visibility": "public",
+      "acting_roles": ["Player"]
+    },
+    "Final_offer": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "private",
+      "acting_roles": ["Player"]
+    }
+  },
+  "end_conditions": [],
+  "agents": [
+    {"name": "Alice", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Bob", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Charlie", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Diana", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Eve", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Frank", "role": "Player", "team": "Players", "agent_model": "gpt-4o"}
+  ]
+}

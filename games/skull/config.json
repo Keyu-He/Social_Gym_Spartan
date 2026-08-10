@@ -1,0 +1,27 @@
+{
+    "scenario": "Skull",
+    "description": "This game is called Skull (Skull & Roses). There are 4 players. Each player starts with 4 discs: 3 roses and 1 skull.\n\nGAME STRUCTURE: The game plays over multiple rounds until someone wins a round or only 1 player remains.\n\nEach round has three phases: Place, Bid, and Flip.\n- During Place, players take turns placing ONE disc face-down from their hand (choose 'rose' or 'skull'). After everyone has placed at least 1 disc, any player can start bidding by choosing 'bid N' instead. If your hand is empty, you MUST say 'bid N' to start bidding.\n- During Bid, players take turns either raising the bid ('bid N', must be higher) or passing ('pass'). When all but one pass, the remaining bidder wins the bid.\n- During Flip, the winning bidder must flip N discs. They MUST flip all their own placed discs first, then choose other players' stacks (flipped top-down). If all flipped discs are roses, the bidder wins the round. If a skull is revealed, the bidder loses 1 random disc permanently.\n\nA player with 0 discs is eliminated. First to win 1 round wins the game.\n\nCOMMANDS:\n- Place phase: 'rose', 'skull', or 'bid N' (to start bidding, N = number of discs you think you can flip safely).\n- Bid phase: 'bid N' (higher than current bid) or 'pass'.\n- Flip phase (bidder only): 'flip NAME' to flip the top disc of NAME's stack.\n\nPlayers: {agent_names}.",
+    "role_goals": {
+        "Player": "Win a round by successfully flipping roses, or be the last player remaining. Place skulls strategically to trap opponents who bid high."
+    },
+    "role_secrets": {},
+    "wins_needed": 1,
+    "initial_state": "Place",
+    "state_transition": {
+        "Place": "Place",
+        "Bid": "Bid",
+        "Flip": "Flip"
+    },
+    "state_properties": {
+        "Place": {"actions": ["action"], "action_order": "round-robin", "visibility": "public"},
+        "Bid": {"actions": ["action"], "action_order": "round-robin", "visibility": "public"},
+        "Flip": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    },
+    "end_conditions": [],
+    "agents": [
+        {"name": "Alice", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Bob", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Charlie", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Diana", "role": "Player", "team": "Players", "agent_model": "gpt-4o"}
+    ]
+}

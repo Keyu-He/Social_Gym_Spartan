@@ -1,0 +1,16 @@
+{
+    "scenario": "Stag Hunt",
+    "description": "4 players play iterated Stag Hunt for exactly 10 rounds. You cannot speak to the other players. Each round, simultaneously choose 'stag' or 'hare'. If ALL choose stag: 5 points each. If anyone chooses hare: stag hunters get 0, hare hunters get 2. GOAL: Maximize your own score over the 10 rounds. Players in the top half by total score win; players in the bottom half lose. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own score over 10 rounds. Players in the top half by total score win."
+    },
+    "role_secrets": {},
+    "max_rounds": 10,
+    "initial_state": "Choose",
+    "state_transition": {
+        "Choose": "Choose"
+    },
+    "state_properties": {
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

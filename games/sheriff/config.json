@@ -1,0 +1,31 @@
+{
+    "scenario": "Sheriff of Nottingham",
+    "description": "This game is called Sheriff of Nottingham. There are 4 players. The game lasts 4 rounds -- each player is the Sheriff exactly once.\n\nGAME STRUCTURE: Each round has three phases: Pack, Negotiate, and Inspect.\n- During Pack, all non-Sheriff players secretly choose to pack 'honest' (3 legal goods worth 3 gold) or 'smuggle' (contraband worth 8 gold if not caught).\n- During Negotiate, players discuss with the Sheriff. They can offer bribes or try to convince the Sheriff they are honest.\n- During Inspect, the Sheriff decides for each non-Sheriff player whether to 'inspect NAME' or 'pass NAME'.\n  * If inspected and honest: Sheriff pays 2 gold penalty to that player.\n  * If inspected and smuggling: Player pays 4 gold penalty to Sheriff, gets 0 gold from goods.\n  * If passed: Player keeps their goods (honest=3 gold, smuggle=8 gold).\n\nAfter 4 rounds, players are ranked by total gold. The top half (2 of 4) win; the bottom half (2 of 4) lose.\n\nPlayers: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your gold over 4 rounds. When packing, decide whether to be honest or smuggle. When Sheriff, decide who to inspect. Use negotiation to your advantage."
+    },
+    "role_secrets": {},
+    "total_rounds": 4,
+    "honest_value": 3,
+    "smuggle_value": 8,
+    "inspect_honest_penalty": 2,
+    "inspect_smuggle_penalty": 4,
+    "initial_state": "Pack",
+    "state_transition": {
+        "Pack": "Negotiate",
+        "Negotiate": "Inspect",
+        "Inspect": "Pack"
+    },
+    "state_properties": {
+        "Pack": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"},
+        "Negotiate": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
+        "Inspect": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    },
+    "end_conditions": [],
+    "agents": [
+        {"name": "Alice", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Bob", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Charlie", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+        {"name": "Diana", "role": "Player", "team": "Players", "agent_model": "gpt-4o"}
+    ]
+}

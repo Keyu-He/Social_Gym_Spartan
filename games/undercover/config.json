@@ -1,0 +1,76 @@
+{
+    "scenario": "Undercover",
+    "description": "A social deduction game where players describe a secret word. Most players (Civilians) have the same word, but two players (Undercovers) have a different but related word. GAME STRUCTURE: two Undercovers, four Civilians. WIN CONDITIONS: Civilians win by eliminating both Undercovers. The Undercovers win if the game reaches a state with exactly 1 Undercover and 1 Civilian remaining. PHASES: (1) Description: Players take turns describing their word using one sentence, without revealing the word itself. (2) Voting: Players vote to eliminate suspected Undercovers. STRATEGY: Civilians must be vague enough to not help the Undercover but specific enough to prove their identity. The Undercover must infer the Civilians' word and blend in. \n\n The players in this game are: {agent_names}.",
+    "role_goals": {
+        "Civilian": "Describe your word subtly and identify the player with the different word.",
+        "Undercover": "Infer the Civilians' word and blend in without being caught."
+    },
+    "role_secrets": {
+        "Civilian": "Your secret word is: {civilian_word}.",
+        "Undercover": "Your secret word is: {undercover_word}."
+    },
+    "word_pair_pool": [
+        {"civilian": "dolphin", "undercover": "octopus", "category": "animal"},
+        {"civilian": "penguin", "undercover": "flamingo", "category": "animal"},
+        {"civilian": "giraffe", "undercover": "elephant", "category": "animal"},
+        {"civilian": "butterfly", "undercover": "hedgehog", "category": "animal"},
+        {"civilian": "cheetah", "undercover": "kangaroo", "category": "animal"},
+        {"civilian": "chameleon", "undercover": "rhinoceros", "category": "animal"},
+        {"civilian": "pizza", "undercover": "hamburger", "category": "food"},
+        {"civilian": "sushi", "undercover": "taco", "category": "food"},
+        {"civilian": "banana", "undercover": "watermelon", "category": "food"},
+        {"civilian": "pancake", "undercover": "croissant", "category": "food"},
+        {"civilian": "chocolate", "undercover": "popcorn", "category": "food"},
+        {"civilian": "bicycle", "undercover": "motorcycle", "category": "vehicle"},
+        {"civilian": "airplane", "undercover": "helicopter", "category": "vehicle"},
+        {"civilian": "submarine", "undercover": "sailboat", "category": "vehicle"},
+        {"civilian": "skateboard", "undercover": "scooter", "category": "vehicle"},
+        {"civilian": "soccer", "undercover": "basketball", "category": "sport"},
+        {"civilian": "tennis", "undercover": "badminton", "category": "sport"},
+        {"civilian": "baseball", "undercover": "hockey", "category": "sport"},
+        {"civilian": "golf", "undercover": "cricket", "category": "sport"},
+        {"civilian": "guitar", "undercover": "violin", "category": "musical instrument"},
+        {"civilian": "trumpet", "undercover": "saxophone", "category": "musical instrument"},
+        {"civilian": "piano", "undercover": "accordion", "category": "musical instrument"},
+        {"civilian": "doctor", "undercover": "firefighter", "category": "profession"},
+        {"civilian": "teacher", "undercover": "librarian", "category": "profession"},
+        {"civilian": "chef", "undercover": "magician", "category": "profession"},
+        {"civilian": "swimming", "undercover": "skiing", "category": "activity"},
+        {"civilian": "painting", "undercover": "sculpting", "category": "activity"},
+        {"civilian": "cooking", "undercover": "gardening", "category": "activity"},
+        {"civilian": "knitting", "undercover": "photography", "category": "activity"},
+        {"civilian": "volcano", "undercover": "earthquake", "category": "natural phenomenon"},
+        {"civilian": "rainbow", "undercover": "aurora", "category": "natural phenomenon"},
+        {"civilian": "tornado", "undercover": "lightning", "category": "natural phenomenon"},
+        {"civilian": "glacier", "undercover": "waterfall", "category": "natural phenomenon"},
+        {"civilian": "library", "undercover": "museum", "category": "place"},
+        {"civilian": "beach", "undercover": "mountain", "category": "place"},
+        {"civilian": "lighthouse", "undercover": "bridge", "category": "place"},
+        {"civilian": "castle", "undercover": "cathedral", "category": "place"},
+        {"civilian": "aquarium", "undercover": "observatory", "category": "place"},
+        {"civilian": "telescope", "undercover": "microscope", "category": "object"},
+        {"civilian": "umbrella", "undercover": "hammock", "category": "object"},
+        {"civilian": "vacuum cleaner", "undercover": "lawn mower", "category": "object"},
+        {"civilian": "sewing machine", "undercover": "paintbrush", "category": "object"}
+    ],
+    "initial_state": "Round_description",
+    "state_transition": {
+        "Round_description": "Round_vote",
+        "Round_vote": "Round_description"
+    },
+    "state_properties": {
+        "Round_description": {
+            "actions": [
+                "speak"
+            ],
+            "visibility": "public"
+        },
+        "Round_vote": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        }
+    }
+}

@@ -1,0 +1,22 @@
+{
+    "scenario": "Battle of the Sexes",
+    "description": "Two players coordinate on an activity for exactly 10 rounds. Each round has two phases: (1) Discuss — players take turns speaking to negotiate which venue to attend; (2) Choose — players simultaneously and privately choose 'opera' or 'football'. Both opera = Alice gets 3, Bob gets 2. Both football = Alice gets 2, Bob gets 3. Miscoordination = 0 each. GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own score over 10 rounds. Use the discussion phase to negotiate and coordinate on the same venue. Higher total score wins."
+    },
+    "role_secrets": {},
+    "payoff_matrix": {
+        "opera": {"opera": [3, 2], "football": [0, 0]},
+        "football": {"opera": [0, 0], "football": [2, 3]}
+    },
+    "max_rounds": 10,
+    "initial_state": "Discuss",
+    "state_transition": {
+        "Discuss": "Choose",
+        "Choose": "Discuss"
+    },
+    "state_properties": {
+        "Discuss": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

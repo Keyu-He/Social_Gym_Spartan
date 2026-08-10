@@ -1,0 +1,20 @@
+{
+    "scenario": "Survivor",
+    "description": "Each round: discuss freely, then vote someone out. No hidden roles or secrets. Eliminated players become jurors who pick the final winner from the last 2-3 survivors. You need allies to survive but victims' goodwill to win the jury vote. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Survive to the final round and win the jury vote. Remember: the people you vote out will decide if you win!"
+    },
+    "role_secrets": {},
+    "initial_state": "Discussion",
+    "state_transition": {
+        "Discussion": "Vote",
+        "Vote": "Discussion",
+        "Jury_plea": "Jury_vote"
+    },
+    "state_properties": {
+        "Discussion": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
+        "Vote": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"},
+        "Jury_plea": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
+        "Jury_vote": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

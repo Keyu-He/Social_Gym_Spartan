@@ -1,0 +1,49 @@
+{
+  "scenario": "The Resistance",
+  "description": "This game is called The Resistance. Social deduction game with 3 Resistance members vs 2 Spies. A rotating leader proposes mission teams. Everyone votes to approve or reject the proposed team. If approved, team members secretly choose to succeed or fail the mission. The number of fail cards is announced publicly (but not who played them). Resistance members MUST play succeed. Spies may choose either succeed or fail. No player is ever eliminated.\n\nGAME FLOW:\n1. Discussion: All players discuss strategy publicly.\n2. Mission_proposal: The current leader proposes a team using 'propose NAME1 NAME2 ...'.\n3. Mission_vote: All players vote 'approve' or 'reject'.\n   - If rejected: leader rotates, back to Discussion. 5 consecutive rejections = Spies win.\n   - If approved: proceed to Mission_execute.\n4. Mission_execute: Team members secretly play 'succeed' or 'fail'.\n   - Results announced: number of fail cards (not who played them).\n\nMission sizes for 5 players: Mission 1: 2, Mission 2: 3, Mission 3: 2, Mission 4: 3, Mission 5: 3.\n\nWIN CONDITIONS:\n- 3 missions succeed: Resistance wins (1.0), Spies lose (-1.0).\n- 3 missions fail: Spies win (1.0), Resistance loses (-1.0).\n- 5 consecutive rejected proposals: Spies win (1.0), Resistance loses (-1.0).\n\nPlayers: {agent_names}.",
+  "role_goals": {
+    "Resistance": "Complete 3 missions successfully. Identify and exclude spies from mission teams.",
+    "Spy": "Sabotage 3 missions. Get placed on mission teams without being detected as a spy."
+  },
+  "role_secrets": {
+    "Spy": "You are a Spy."
+  },
+  "mission_sizes": [2, 3, 2, 3, 3],
+  "initial_state": "Discussion",
+  "state_transition": {
+    "Discussion": "Mission_proposal",
+    "Mission_proposal": "Mission_vote",
+    "Mission_vote": "Mission_execute",
+    "Mission_execute": "Discussion"
+  },
+  "state_properties": {
+    "Discussion": {
+      "actions": ["speak"],
+      "action_order": "round-robin",
+      "visibility": "public"
+    },
+    "Mission_proposal": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "public"
+    },
+    "Mission_vote": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "public"
+    },
+    "Mission_execute": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "private"
+    }
+  },
+  "end_conditions": [],
+  "agents": [
+    {"name": "Alice", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+    {"name": "Bob", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+    {"name": "Charlie", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+    {"name": "Diana", "role": "Spy", "team": "Spies", "agent_model": "gpt-4o"},
+    {"name": "Eve", "role": "Spy", "team": "Spies", "agent_model": "gpt-4o"}
+  ]
+}

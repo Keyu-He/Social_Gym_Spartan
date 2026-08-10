@@ -1,0 +1,8 @@
+{
+    "agents": [
+        {"name": "Alice", "role": "Player", "team": "None", "agent_model": "gpt-4o"},
+        {"name": "Bob", "role": "Player", "team": "None", "agent_model": "gpt-4o"},
+        {"name": "Charlie", "role": "Player", "team": "None", "agent_model": "gpt-4o"},
+        {"name": "Diana", "role": "Player", "team": "None", "agent_model": "gpt-4o"}
+    ]
+}

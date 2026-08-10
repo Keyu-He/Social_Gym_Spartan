@@ -1,0 +1,25 @@
+{
+    "scenario": "Centipede Game",
+    "description": "Two players play 4 rounds of the Centipede Game. First mover alternates each round so each player starts twice. In each game, players alternate choosing 'take' (end game, claim current payoffs) or 'pass' (pot grows, opponent's turn). The pot grows exponentially -- taking early is safe but low-reward, passing is risky but grows the prize. Cumulative score determines the winner. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your cumulative score across 4 games."
+    },
+    "role_secrets": {},
+    "num_games": 4,
+    "nodes": [
+        [2, 0],
+        [1, 4],
+        [6, 2],
+        [5, 10],
+        [14, 8],
+        [13, 24]
+    ],
+    "pass_through_payoff": [24, 16],
+    "initial_state": "Turn",
+    "state_transition": {
+        "Turn": "Turn"
+    },
+    "state_properties": {
+        "Turn": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

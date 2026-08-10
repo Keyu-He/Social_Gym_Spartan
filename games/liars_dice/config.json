@@ -1,0 +1,28 @@
+{
+  "scenario": "Liar's Dice",
+  "description": "This game is called Liar's Dice. Each player has hidden dice (rolled fresh each round). Players take turns making bids about the total count of a face value across ALL players' dice. Each bid must be higher than the previous (higher quantity, or same quantity with higher face value). Instead of bidding higher, you can call 'liar' to challenge the current bid.\n\nRESOLUTION: When 'liar' is called, all dice are revealed. If the actual count of the bid face is LESS than the bid quantity, the bidder was lying and loses a die. If the actual count MEETS or EXCEEDS the bid, the caller was wrong and loses a die. A new round begins with fresh dice rolls.\n\nELIMINATION: Lose all your dice and you are eliminated. Last player standing wins.\n\nCOMMANDS:\n- 'bid QUANTITY FACE' to make a bid (e.g., 'bid 3 4' means 'at least three 4s among all dice').\n- 'liar' to challenge the current bid.\n\nPlayers: {agent_names}.",
+  "role_goals": {
+    "Player": "Be the last player with dice remaining. Bluff strategically and call liars wisely."
+  },
+  "role_secrets": {
+    "Player": "Your dice are revealed privately each round."
+  },
+  "starting_dice": 5,
+  "initial_state": "Bidding",
+  "state_transition": {
+    "Bidding": "Bidding"
+  },
+  "state_properties": {
+    "Bidding": {
+      "actions": ["action"],
+      "action_order": "round-robin",
+      "visibility": "public"
+    }
+  },
+  "end_conditions": [],
+  "agents": [
+    {"name": "Alice", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Bob", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
+    {"name": "Charlie", "role": "Player", "team": "Players", "agent_model": "gpt-4o"}
+  ]
+}

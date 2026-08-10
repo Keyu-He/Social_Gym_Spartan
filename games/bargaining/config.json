@@ -1,0 +1,19 @@
+{
+    "scenario": "Bargaining",
+    "description": "Two players play the Bargaining Game (iterated ultimatum) for exactly 10 rounds. You cannot speak to the other player. Each round, one player is the Proposer and the other is the Responder (roles alternate each round). The Proposer has 10 tokens to split: they choose 'offer N' where N is how many tokens the Proposer keeps (Responder gets 10-N). The Responder chooses 'accept' or 'reject'. Accept: both get their share. Reject: both get 0 for that round. GOAL: Maximize your own total tokens over the 10 rounds. The player with the higher total wins. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own total tokens over 10 rounds. Higher total wins."
+    },
+    "role_secrets": {},
+    "max_rounds": 10,
+    "tokens_per_round": 10,
+    "initial_state": "Propose",
+    "state_transition": {
+        "Propose": "Respond",
+        "Respond": "Propose"
+    },
+    "state_properties": {
+        "Propose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"},
+        "Respond": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

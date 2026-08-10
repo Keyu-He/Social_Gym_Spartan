@@ -1,0 +1,9 @@
+{
+    "agents": [
+        {"name": "Alice", "role": "Insider", "team": "Insider", "agent_model": "gpt-4o"},
+        {"name": "Bob", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
+        {"name": "Charlie", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
+        {"name": "Diana", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
+        {"name": "Eve", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"}
+    ]
+}

@@ -1,0 +1,20 @@
+{
+    "scenario": "Chicken",
+    "description": "Two players play Chicken (Hawk-Dove) for exactly 10 rounds. You cannot speak to the other player. Each round, simultaneously choose 'swerve' or 'straight'. Both swerve = 3 each. One swerves, one goes straight = 1 for swerver, 5 for straight. Both straight = 0 each (crash!). GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own score over 10 rounds. Higher total score wins."
+    },
+    "role_secrets": {},
+    "payoff_matrix": {
+        "swerve": {"swerve": [3, 3], "straight": [1, 5]},
+        "straight": {"swerve": [5, 1], "straight": [0, 0]}
+    },
+    "max_rounds": 10,
+    "initial_state": "Choose",
+    "state_transition": {
+        "Choose": "Choose"
+    },
+    "state_properties": {
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}

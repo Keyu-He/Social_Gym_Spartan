@@ -1,0 +1,9 @@
+{
+    "agents": [
+        {"name": "Alice", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+        {"name": "Bob", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+        {"name": "Charlie", "role": "Resistance", "team": "Resistance", "agent_model": "gpt-4o"},
+        {"name": "Diana", "role": "Spy", "team": "Spies", "agent_model": "gpt-4o"},
+        {"name": "Eve", "role": "Spy", "team": "Spies", "agent_model": "gpt-4o"}
+    ]
+}

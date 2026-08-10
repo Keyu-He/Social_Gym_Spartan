@@ -1,0 +1,16 @@
+{
+    "scenario": "Minority Game",
+    "description": "5 players play the Minority Game for exactly 12 rounds. You cannot speak to the other players. Each round, simultaneously choose 'go' or 'stay'. If fewer than half go, goers score 3 (minority wins). If half or more go, stayers score 3 (minority wins). You want to be in the minority! GOAL: Maximize your own score over the 12 rounds. The player with the highest score wins. Players: {agent_names}.",
+    "role_goals": {
+        "Player": "Maximize your own score over 12 rounds by being in the minority group. Top half of players by score win."
+    },
+    "role_secrets": {},
+    "max_rounds": 12,
+    "initial_state": "Choose",
+    "state_transition": {
+        "Choose": "Choose"
+    },
+    "state_properties": {
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+    }
+}
