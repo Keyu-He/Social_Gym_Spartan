@@ -1,8 +1,8 @@
 {
     "scenario": "Battle of the Sexes",
-    "description": "Two players coordinate on an activity for exactly 10 rounds. Each round has two phases: (1) Discuss — players take turns speaking to negotiate which venue to attend; (2) Choose — players simultaneously and privately choose 'opera' or 'football'. Both opera = Alice gets 3, Bob gets 2. Both football = Alice gets 2, Bob gets 3. Miscoordination = 0 each. GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Players: {agent_names}.",
+    "description": "Two players coordinate on an activity for exactly 10 rounds. Each round has two phases: (1) Discuss — players take turns speaking to negotiate which venue to attend; (2) Choose — players simultaneously and privately choose 'opera' or 'football'. Both opera = {opera_player} gets 3, {football_player} gets 2. Both football = {opera_player} gets 2, {football_player} gets 3. Miscoordination = 0 each. GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Equal totals are a draw. Unclear choices: a choice that does not name exactly one of 'opera' or 'football' (a venue right after a negation, as in 'not football', does not name that venue), or that fails, is announced to both players and that player is asked once more, while the other choice stays hidden; if the second choice is also unclear, that player's venue is drawn at random, each venue equally likely. A discussion message that fails is not asked again: both players see that the player 'did nothing' on that turn, and the round goes on. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own score over 10 rounds. Use the discussion phase to negotiate and coordinate on the same venue. Higher total score wins."
+        "Player": "Maximize your own score over 10 rounds. Use the discussion phase to negotiate and coordinate on the same venue. Higher total score wins. Equal totals are a draw."
     },
     "role_secrets": {},
     "payoff_matrix": {
@@ -17,6 +17,6 @@
     },
     "state_properties": {
         "Discuss": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
-        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

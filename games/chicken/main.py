@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -70,23 +71,52 @@ class ChickenEvaluator(SocialGameEndEvaluator):
 # ============================================================================
 
 
+MOVES = ("swerve", "straight")
+
+
+# A move word right after a negation in its clause ("I will not swerve", "don't defect") does not name that move.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def names(text: str, word: str) -> bool:
+    """True when `text` uses `word` as a whole word at least once with no negation right before it."""
+    return any(not is_negated(text, m.start()) for m in re.finditer(rf"\b{word}\b", text))
+
+
+def read_move(argument: str) -> str | None:
+    """'swerve' or 'straight' when the reply names exactly one of them as a word, else None.
+
+    A negated move is not named, so "I won't swerve, I go straight" is straight. A reply naming both
+    ("swerve or straight") or neither ("I will not swerve") is not read as a move; the player is asked again.
+    """
+    text = argument.lower().replace("’", "'")
+    named = [m for m in MOVES if names(text, m)]
+    return named[0] if len(named) == 1 else None
+
+
 class ChickenActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
         if not isinstance(env, ChickenEnv):
             return
-        if action.action_type not in ["action", "speak"]:
+        if env.current_state != "Choose" or agent_name not in env.awaiting():
             return
-        if env.current_state == "Choose":
-            tokens = re.findall(r"[a-z]+", action.argument.lower())
-            for tok in tokens:
-                if tok == "straight":
-                    env.internal_state["current_moves"][agent_name] = "straight"
-                    break
-                if tok == "swerve":
-                    env.internal_state["current_moves"][agent_name] = "swerve"
-                    break
+        move = (
+            read_move(action.argument)
+            if action.action_type in ["action", "speak"]
+            else None
+        )
+        env.take_reply(agent_name, move)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, ChickenEnv):
@@ -95,12 +125,18 @@ class ChickenActionHandler(ActionHandler):
             round_num = env.internal_state.get("round", 0) + 1
             max_rounds = env._config.get("max_rounds", 10)
             scores = env.internal_state.get("scores", {})
-            return (
+            text = (
                 f"Round {round_num}/{max_rounds}. Scores: {scores}. "
                 f"Choose 'swerve' or 'straight'. "
                 f"Both swerve=3,3. One swerves, one straight=1,5. Both straight=0,0. "
-                f"Higher total score wins."
+                f"Higher total score wins. Equal totals are a draw."
             )
+            if env.internal_state.get("unclear", {}).get(agent_name):
+                text += (
+                    " Your last reply did not name exactly one of 'swerve' or 'straight', so you are asked again."
+                    " If this reply is also unclear, your move is drawn at random."
+                )
+            return text
         return ""
 
 
@@ -134,26 +170,63 @@ class ChickenEnv(SocialDeductionGame):
             "round": 0,
             "scores": {name: 0 for name in self.agents},
             "current_moves": {},
+            "unclear": {},
+            "drawn": [],
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Moves drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         return obs
 
-    def _check_eliminations(self) -> None:
-        if not self._should_transition_state():
-            return
+    def awaiting(self) -> List[str]:
+        """Players whose move for the current round is not in yet (both, at the start of a round)."""
+        moves = self.internal_state.get("current_moves", {})
+        return [a for a in self.agents if a not in moves]
 
-        if self.current_state == "Choose":
-            moves = self.internal_state.setdefault("current_moves", {})
-            # Default-and-continue: unparsed actions default to the safe choice
-            # so the round always resolves cleanly with no stale carry-over.
-            for agent in self.agents:
-                moves.setdefault(agent, "swerve")
+    def take_reply(self, agent_name: str, move: str | None) -> None:
+        """Hold a clear move; ask an unclear (or failed) reply once more, then draw the move at random.
+
+        Moves stay hidden until the round is complete: the Choose state is private, so a player
+        asked again never sees the other player's reply.
+        """
+        if move is not None:
+            self.internal_state["current_moves"][agent_name] = move
+            return
+        unclear = self.internal_state.setdefault("unclear", {})
+        unclear[agent_name] = unclear.get(agent_name, 0) + 1
+        round_num = self.internal_state.get("round", 0) + 1
+        if unclear[agent_name] == 1:
+            message = (
+                f"[Round {round_num}] {agent_name}'s reply did not name exactly one of 'swerve' or 'straight', "
+                f"so {agent_name} is asked again. Moves stay hidden until the round is complete."
+            )
+        else:
+            self.internal_state["current_moves"][agent_name] = (
+                self._fallback_rng.choice(MOVES)
+            )
+            self.internal_state.setdefault("drawn", []).append(agent_name)
+            message = (
+                f"[Round {round_num}] {agent_name}'s second reply was also unclear, "
+                f"so {agent_name}'s move is drawn at random."
+            )
+        self.recv_message("Environment", SimpleMessage(message=message))
+
+    def _update_action_mask(self) -> None:
+        super()._update_action_mask()
+        if self.current_state == "Choose" and "current_moves" in self.internal_state:
+            due = self.awaiting()
+            self.action_mask = [a in due for a in self.agents]
+
+    def _check_eliminations(self) -> None:
+        if self.current_state == "Choose" and not self.awaiting():
+            moves = self.internal_state["current_moves"]
+            drawn = self.internal_state.get("drawn", [])
             agents = list(self.agents)
             a1, a2 = agents[0], agents[1]
-            m1 = moves.get(a1, "swerve")
-            m2 = moves.get(a2, "swerve")
+            m1 = moves[a1]
+            m2 = moves[a2]
 
             payoff_matrix = self._config.get("payoff_matrix", {})
             try:
@@ -169,11 +242,16 @@ class ChickenEnv(SocialDeductionGame):
             round_num = self.internal_state["round"] + 1
             self.internal_state["round"] = round_num
             self.internal_state["current_moves"] = {}
+            self.internal_state["unclear"] = {}
+            self.internal_state["drawn"] = []
+
+            def shown(name: str, move: str) -> str:
+                return f"{move} (drawn at random)" if name in drawn else move
 
             self.recv_message(
                 "Environment",
                 SimpleMessage(
-                    message=f"[Round {round_num}] {a1} chose {m1}, {a2} chose {m2}. "
+                    message=f"[Round {round_num}] {a1} chose {shown(a1, m1)}, {a2} chose {shown(a2, m2)}. "
                     f"Payoff: {a1}={r1}, {a2}={r2}. Scores: {scores}"
                 ),
             )
@@ -230,7 +308,8 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[ChickenEvaluator(max_turn_number=10)],
+        # Safety cap only: every round takes one step, or two when a player is asked again.
+        evaluators=[ChickenEvaluator(max_turn_number=2 * config.get("max_rounds", 10))],
         terminal_evaluators=[],
         hide_unknown=True,
     )

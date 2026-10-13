@@ -1,8 +1,8 @@
 {
     "scenario": "Prisoner's Dilemma",
-    "description": "Two players must secretly choose to Cooperate or Defect. You play exactly 5 rounds. You cannot speak to the other player. You can only choose your action. The payoffs depend on the combination of choices. COOPERATE/COOPERATE: 3 points each. DEFECT/COOPERATE: Defector gets 5, Cooperator gets 0. DEFECT/DEFECT: 1 point each. GOAL: Maximize your own score over the 5 rounds. The player with the higher total score wins. Players: {agent_names}.",
+    "description": "Two players must secretly choose to Cooperate or Defect. You play exactly 5 rounds. You cannot speak to the other player. You can only choose your action. The payoffs depend on the combination of choices. COOPERATE/COOPERATE: 3 points each. DEFECT/COOPERATE: Defector gets 5, Cooperator gets 0. DEFECT/DEFECT: 1 point each. GOAL: Maximize your own score over the 5 rounds. The player with the higher total score wins. Equal totals are a draw. Unclear replies: a reply that does not name exactly one of 'cooperate' or 'defect' (a move word right after a negation, as in 'I will not defect', does not name that move), or that fails, is announced to both players and that player is asked once more, while the other move stays hidden; if the second reply is also unclear, that player's move is drawn at random, each move equally likely. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own score over 5 rounds. Higher total score wins."
+        "Player": "Maximize your own score over 5 rounds. Higher total score wins. Equal totals are a draw."
     },
     "role_secrets": {
         "Player": "You can choose to Cooperate or Defect."
@@ -29,6 +29,7 @@
             ]
         }
     },
+    "max_rounds": 5,
     "initial_state": "Next Round",
     "state_transition": {
         "Next Round": "Next Round"
@@ -39,7 +40,7 @@
                 "action"
             ],
             "action_order": "simultaneous",
-            "visibility": "public"
+            "visibility": "private"
         }
     }
 }

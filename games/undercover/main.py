@@ -6,8 +6,9 @@ import asyncio
 import logging
 import os
 import random
+import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import redis
 from redis_om import get_redis_connection
@@ -150,17 +151,18 @@ class UndercoverGameEndEvaluator(SocialGameEndEvaluator):
     def __call__(
         self, turn_number: int, messages: List[tuple[str, Message]], **kwargs: Any
     ) -> List[tuple[str, tuple[tuple[str, int | float | bool], str]]]:
-        # Check turn limit
-        if turn_number >= self.max_turn_number:
-            return [("environment", (("terminated", True), "Max turns reached"))]
-
         env = kwargs.get("env")
         if not env:
+            if turn_number >= self.max_turn_number:
+                return [("environment", (("terminated", True), "Max turns reached"))]
             return [("environment", (("terminated", False), ""))]
 
+        # Win conditions first: a vote that decides the game on the capped turn is a win, not a draw.
         terminated, reason, rewards = self._check_win_conditions(
             env, turn_number, messages
         )
+        if not terminated and turn_number >= self.max_turn_number:
+            return [("environment", (("terminated", True), "Max turns reached"))]
 
         response: List[tuple[str, tuple[tuple[str, int | float | bool], str]]] = [
             ("environment", (("terminated", terminated), reason))
@@ -171,7 +173,7 @@ class UndercoverGameEndEvaluator(SocialGameEndEvaluator):
             for agent_name, reward in rewards.items():
                 try:
                     idx = agent_names.index(agent_name)
-                    generic_key = f"agent_{idx+1}"
+                    generic_key = f"agent_{idx + 1}"
                     response.append((generic_key, (("complete_rating", reward), "")))
                 except ValueError:
                     continue
@@ -196,30 +198,136 @@ class UndercoverActionHandler(ActionHandler):
             # Collect votes for elimination
             if "votes" not in env.internal_state:
                 env.internal_state["votes"] = {}
+            if not _acting(env, agent_name):
+                return
 
-            if action.action_type == "action" and "vote" in action.argument.lower():
-                # Parse target from "vote Aurora" or "I vote for Aurora"
-                words = action.argument.split()
-                # Try to find a name (capitalized word)
-                target = next(
-                    (
-                        a
-                        for w in words
-                        for a in env.agents
-                        if w.lower().strip(",.;:!?") == a.lower()
-                    ),
-                    None,
-                )
-                if target:
-                    env.internal_state["votes"][agent_name] = target
+            # Only a player still in the game can be voted for. Anything else is an abstention, announced to all
+            # (the votes themselves are public), so the mistake stays visible and cannot cancel the vote.
+            text = action.argument if action.action_type == "action" else ""
+            target, mentioned = read_named_player(text, list(env.agents))
+            if target and env.agent_alive.get(target, False):
+                env.internal_state["votes"][agent_name] = target
+                return
+            if target:
+                reason = f"{agent_name}'s vote for {target} does not count: {target} is already out of the game."
+            elif mentioned:
+                reason = f"{agent_name}'s vote names several players ({', '.join(mentioned)}) and no single 'vote NAME'."
+            elif re.search(rf"\b(?:{_VOTE_VERB})\b", text, re.IGNORECASE):
+                reason = f"{agent_name}'s vote names no player."
+            else:
+                reason = f"{agent_name} cast no vote."
+            env.recv_message(
+                "Environment",
+                SimpleMessage(message=f"[Game] {reason} Counted as an abstention."),
+            )
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         """Get specific action instructions for an agent based on current state."""
 
         if env.current_state == "Round_vote":
-            return "It is voting time. You MUST use the command 'vote NAME' to vote for the player you suspect is the Undercover. e.g. 'vote Alice'"
+            return (
+                "It is voting time. You MUST use the command 'vote NAME' to vote for the player you want out. "
+                f"e.g. 'vote Alice'. Players still in the game: {_living_list(env)}. A vote for a player "
+                "who is out, or a vote that names no single player, counts as an abstention. The player with the "
+                "most counted votes is out; if the top vote is tied, one of the tied players is drawn at random "
+                "(announced to everyone)."
+            )
 
         return ""
+
+
+def _acting(env: SocialDeductionGame, agent_name: str) -> bool:
+    """Whether the engine asked this player to act in the step being processed."""
+    try:
+        return bool(env.action_mask[env.agents.index(agent_name)])
+    except (ValueError, IndexError):
+        return False
+
+
+def _living_list(env: SocialDeductionGame) -> str:
+    return ", ".join(a for a in env.agents if env.agent_alive.get(a, False))
+
+
+_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+# Between a command word and the name it takes: punctuation, markdown, quotes, "for" ("vote for Bob").
+_GAP = r"""[\s:*_'"`@(\[-]*(?:(?:for|against|out)\s+[\s*_'"`@(\[-]*)?"""
+_VOTE_VERB = r"vot(?:e|es|ed|ing)"
+# A word that turns what follows around ("I won't vote Bob", "Carol, not Bob", "It's not hail").
+_NEG_CUE = r"(?:\bnot|\bnever|n't|\bcannot|\brather\s+than|\binstead\s+of)\b"
+# A negation reaches to the end of its clause.
+_CLAUSE_BREAK = r"[.;:!?,\n]|\bbut\b"
+# What may stand between a negation and the name it negates ("not Bob", "not for **Bob**").
+_NAME_LEAD = r"""(?:\s+(?:for|on|against|with))?[\s*_'"`@(\[-]*$"""
+
+
+def _name_re(name: str) -> str:
+    return (
+        r"(?<![A-Za-z])" + r"\s+".join(map(re.escape, name.split())) + r"(?![A-Za-z])"
+    )
+
+
+def _clause_before(text: str, pos: int) -> str:
+    return re.split(_CLAUSE_BREAK, text[:pos], flags=re.IGNORECASE)[-1]
+
+
+def _negated_command(text: str, pos: int, verb: str, names: List[str]) -> bool:
+    """Whether the command word at ``pos`` is negated: a negation at most three words before it in its clause, with
+    no command word or player name in between ("I won't vote", "I do not want to vote", "don't kill")."""
+    m = re.search(
+        rf"{_NEG_CUE}((?:\W+\w+){{0,3}})\W*$", _clause_before(text, pos), re.IGNORECASE
+    )
+    if not m:
+        return False
+    between = m.group(1)
+    return not re.search(rf"\b(?:{verb})\b", between, re.IGNORECASE) and not any(
+        re.search(_name_re(n), between) for n in names
+    )
+
+
+def read_named_player(
+    text: str, names: List[str], verb: str = _VOTE_VERB
+) -> Tuple[str | None, List[str]]:
+    """The player a move names, read as a person at the table would read it.
+
+    The name right after the command word counts ("vote Bob", "vote for Bob", "vote: **'Bob'**"), wherever it
+    stands in the reply, unless the command is negated: "I won't vote Bob, vote Carol" is a vote for Carol.
+    Otherwise the reply counts for a player only if it is just that name or names exactly one player (written with
+    a capital, so the word "mark" is not a vote for Mark), and a negated mention does not count: "My vote goes to
+    Carol, not Bob" names Carol. Names match as whole words, so punctuation, quotes, markdown and a trailing "'s" do
+    not matter. Returns (player, []) or, when no single player is named, (None, the players mentioned).
+    """
+    text = (text or "").translate(_QUOTES)
+    hits: List[Tuple[int, str]] = []
+    negated: List[Tuple[int, int]] = []
+    for n in names:
+        for m in re.finditer(
+            rf"\b(?:{verb})\b{_GAP}{_name_re(n)}", text, re.IGNORECASE
+        ):
+            if not _negated_command(text, m.start(), verb, names):
+                hits.append((m.start(), n))
+                continue
+            stop = re.search(_CLAUSE_BREAK, text[m.end() :], re.IGNORECASE)
+            negated.append((m.start(), m.end() + stop.start() if stop else len(text)))
+    if hits:
+        return min(hits)[1], []
+    words = re.sub(r"[\W_]+", " ", text).strip().lower()
+    for n in names:
+        if words == " ".join(n.lower().split()):
+            return n, []
+    mentioned = [
+        n
+        for n in names
+        if any(
+            not re.search(
+                _NEG_CUE + _NAME_LEAD, _clause_before(text, m.start()), re.IGNORECASE
+            )
+            and not any(a <= m.start() < b for a, b in negated)
+            for m in re.finditer(_name_re(n), text)
+        )
+    ]
+    if len(mentioned) == 1:
+        return mentioned[0], []
+    return None, mentioned
 
 
 class UndercoverEnv(SocialDeductionGame):
@@ -253,21 +361,52 @@ class UndercoverEnv(SocialDeductionGame):
             return
 
         if self.current_state == "Round_vote":
-            # Tally votes and eliminate most voted player
+            # Tally votes and eliminate most voted player (every recorded vote names a living player)
             votes = self.internal_state.get("votes", {})
-            if votes:
+            if not votes:
+                self.recv_message(
+                    "Environment",
+                    SimpleMessage(
+                        message="[Game] No valid votes: nobody is voted out this round."
+                    ),
+                )
+            else:
                 vote_counts: Dict[str, int] = {}
                 for target in votes.values():
                     vote_counts[target] = vote_counts.get(target, 0) + 1
 
                 if vote_counts:
-                    # Find player with most votes
-                    eliminated = max(vote_counts, key=vote_counts.get)  # type: ignore
-                    self.agent_alive[eliminated] = False
+                    # How each vote was read, so a misread is visible.
                     self.recv_message(
                         "Environment",
                         SimpleMessage(
-                            message=f"[Game] {eliminated} was voted out! They were a {self.agent_to_role[eliminated]}."
+                            message="[Game] Votes counted: "
+                            + ", ".join(
+                                f"{v} -> {votes[v]}" for v in self.agents if v in votes
+                            )
+                            + "."
+                        ),
+                    )
+                    top = max(vote_counts.values())
+                    tied = [n for n, c in vote_counts.items() if c == top]
+                    eliminated = tied[0]
+                    if len(tied) > 1:
+                        eliminated = self.break_tie(tied)
+                        self.recv_message(
+                            "Environment",
+                            SimpleMessage(
+                                message=f"[Game] Vote tied between {', '.join(tied)} "
+                                f"({top} each). Random draw: {eliminated}."
+                            ),
+                        )
+                    self.agent_alive[eliminated] = False
+                    # The eliminated player's side is announced (common play); nobody is told their own side.
+                    role = self.agent_to_role[eliminated]
+                    self.recv_message(
+                        "Environment",
+                        SimpleMessage(
+                            message=f"[Game] {eliminated} was voted out! They were "
+                            f"{'an' if role[:1] in 'AEIOU' else 'a'} {role}."
                         ),
                     )
                     _gen_logger.info(

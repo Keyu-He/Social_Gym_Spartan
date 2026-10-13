@@ -1,8 +1,8 @@
 {
     "scenario": "Stag Hunt",
-    "description": "4 players play iterated Stag Hunt for exactly 10 rounds. You cannot speak to the other players. Each round, simultaneously choose 'stag' or 'hare'. If ALL choose stag: 5 points each. If anyone chooses hare: stag hunters get 0, hare hunters get 2. GOAL: Maximize your own score over the 10 rounds. Players in the top half by total score win; players in the bottom half lose. Players: {agent_names}.",
+    "description": "4 players play iterated Stag Hunt for exactly 10 rounds. You cannot speak to the other players. Each round, simultaneously choose 'stag' or 'hare'. If ALL choose stag: 5 points each. If anyone chooses hare: stag hunters get 0, hare hunters get 2. GOAL: Maximize your own score over the 10 rounds. Players in the top half by total score win; players in the bottom half lose. Players with equal totals share one result: a tied group that lies entirely within the top 2 places wins, one that lies entirely within the bottom 2 places loses, and any other tied group (one that straddles the line between 2nd and 3rd place) draws. For example, with totals 30, 30, 30, 12, the three players on 30 draw and the player on 12 loses; with totals 30, 20, 20, 12, the player on 30 wins, the two players on 20 draw and the player on 12 loses. Unclear replies: a reply that does not name exactly one of 'stag' or 'hare' (a move word right after a negation, as in 'not hare', does not name that move), or that fails, is announced to everyone and that player is asked once more, while the other moves stay hidden; if the second reply is also unclear, that player's move is drawn at random, each move equally likely. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own score over 10 rounds. Players in the top half by total score win."
+        "Player": "Maximize your own score over 10 rounds. Players in the top half by total score win. Players with equal totals share one result; a tied group that straddles the line between winners and losers draws."
     },
     "role_secrets": {},
     "max_rounds": 10,
@@ -11,6 +11,6 @@
         "Choose": "Choose"
     },
     "state_properties": {
-        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

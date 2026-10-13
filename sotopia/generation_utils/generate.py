@@ -1,7 +1,11 @@
 import logging
+import asyncio
 import os
 import re
 import json
+import time
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from litellm import acompletion
 from litellm.exceptions import BadRequestError
@@ -67,6 +71,235 @@ _TEMPERATURE_SENTINEL = object()
 
 # Cache temperature support per (model, base_url) to avoid repeated bad requests
 _TEMPERATURE_SUPPORT_CACHE: dict[tuple[str, str | None], bool] = {}
+
+# Reasoning text from the most recent completion in this asyncio task. Thinking
+# models served with a vLLM reasoning parser return it separately from the JSON
+# action; callers that log responses read it right after awaiting. A ContextVar
+# keeps concurrent episodes from seeing each other's reasoning.
+LAST_REASONING: ContextVar[str | None] = ContextVar("last_reasoning", default=None)
+GENERATION_OPTIONS: ContextVar[dict[str, Any]] = ContextVar(
+    "generation_options", default={}
+)
+LAST_COMPLETION_METADATA: ContextVar[dict[str, Any] | None] = ContextVar(
+    "last_completion_metadata", default=None
+)
+# Identity of the episode the current task is playing (set by the tournament runner) so
+# per-call progress events can be attributed to it.
+CURRENT_EPISODE: ContextVar[str] = ContextVar("current_episode", default="")
+
+
+def log_progress_event(kind: str, **fields: Any) -> None:
+    """Append one JSON line to SOTOPIA_PROGRESS_LOG (no-op when unset).
+
+    kinds: "start" (an episode begins), "call" (one model response: ok / failed, with
+    retry=True for a transient failure that will be retried), "end" (episode written).
+    Read by experiments/run_progress.py to draw a live picture of a run.
+    """
+    path = os.environ.get("SOTOPIA_PROGRESS_LOG")
+    if not path:
+        return
+    rec = {"ts": time.time(), "kind": kind, "episode": CURRENT_EPISODE.get(), **fields}
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+_GENERATION_OPTION_KEYS = {
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "max_tokens",
+    "seed",
+    "extra_body",
+}
+
+
+def _generation_options() -> dict[str, Any]:
+    """Only inference controls may override the request, never its routing/schema."""
+    options = deepcopy(GENERATION_OPTIONS.get())
+    unknown = options.keys() - _GENERATION_OPTION_KEYS
+    if unknown:
+        raise ValueError(f"Unsupported generation options: {sorted(unknown)}")
+    if "extra_body" in options:
+        body = options["extra_body"]
+        allowed = (_GENERATION_OPTION_KEYS - {"extra_body"}) | {"chat_template_kwargs"}
+        if not isinstance(body, dict) or body.keys() - allowed:
+            raise ValueError(
+                "extra_body may contain only inference controls and chat_template_kwargs"
+            )
+        if "chat_template_kwargs" in body and not isinstance(
+            body["chat_template_kwargs"], dict
+        ):
+            raise ValueError("chat_template_kwargs must be a dictionary")
+        overlap = body.keys() & (options.keys() - {"extra_body"})
+        if overlap:
+            raise ValueError(
+                f"Duplicate generation options in extra_body: {sorted(overlap)}"
+            )
+    return options
+
+
+# Failed model calls, one rule (experiments/utils.turn_request_failed reads logs by the same rule):
+# - A request failure is an exception from the completion call, a response with no choices, or a generation
+#   the server aborted (finish_reason 'abort', vLLM's server-side abort, or 'error'; also no finish reason
+#   and no content, where nothing shows a completed generation). It is not the model's doing: it is retried
+#   with backoff when transient, and if it still fails the turn's log entry gets request_failed=True, so the
+#   rating code drops the episode and the tournament runner replays it. A deterministic rejection (HTTP 400,
+#   including a prompt over the context window) also gets permanent_failure=True: the runner reports it and
+#   does not replay it, and it is still never rated.
+# - Anything the server completed is the model's move, played as 'none' when it cannot be used, never retried
+#   or repaired, and rated: JSON that does not parse, an empty reply that stopped normally, a reply cut off at
+#   the token limit, a structured-output refusal (its text is kept in the log) or a reply a content filter
+#   withheld. The log keeps the model's raw reply next to the error.
+DEFAULT_ENDPOINT_RETRIES = 6
+DEFAULT_ENDPOINT_RETRY_WAIT = 5.0  # seconds before the first retry; doubles each retry
+DEFAULT_ENDPOINT_RETRY_MAX_WAIT = 60.0
+_TRANSIENT_STATUS = {408, 409, 425, 429}
+# finish_reason values that mean the server stopped the generation itself rather than completing it.
+SERVER_ABORT_FINISH_REASONS = frozenset({"abort", "error"})
+
+
+class EmptyCompletionError(RuntimeError):
+    """The API answered without usable content (see _content_or_raise for which cases are the model's move)."""
+
+    def __init__(self, message: str, finish_reason: Any = None) -> None:
+        super().__init__(message)
+        self.finish_reason = finish_reason
+
+
+class ModelRefusalError(RuntimeError):
+    """A structured-output refusal: the server completed the request and the model declined to answer."""
+
+    def __init__(self, message: str, refusal: str, finish_reason: Any = None) -> None:
+        super().__init__(message)
+        self.refusal = refusal
+        self.finish_reason = finish_reason
+
+
+class StructuredOutputUnsupported(RuntimeError):
+    """The model does not support a response schema (checked before the request is sent)."""
+
+
+def _attach_reply(exc: BaseException, prompt: list[dict[str, str]], reply: str) -> None:
+    """Keep the prompt and the model's raw reply on a model-output error, so the log shows the reply."""
+    try:
+        setattr(exc, "_sotopia_prompt", prompt)
+        setattr(exc, "_sotopia_raw_reply", reply)
+    except Exception:
+        pass
+
+
+def _mark_request_error(exc: BaseException) -> None:
+    """The completion request itself failed (raised by acompletion)."""
+    try:
+        setattr(exc, "_sotopia_request_error", True)
+    except Exception:
+        pass
+
+
+def _mark_model_output_error(exc: BaseException) -> None:
+    """The request succeeded and the model's reply could not be used: the model's own move."""
+    try:
+        setattr(exc, "_sotopia_model_output", True)
+    except Exception:
+        pass
+
+
+def is_model_output_error(exc: BaseException) -> bool:
+    return bool(getattr(exc, "_sotopia_model_output", False))
+
+
+def is_retryable_request_error(exc: BaseException) -> bool:
+    """A failed request worth waiting out: connection or timeout errors, server errors, rate limits, a
+    self-hosted server that is restarting (HTTP 404 or a model-loading message), a response with no choices
+    or a generation the server aborted. A model's own reply is never retried, whatever text it contains. A
+    request rejected with another 4xx status is retried only for a model-loading message: the generic words
+    and status numbers in the list below are not looked for in its text ("max_tokens must be at most 500")."""
+    if is_model_output_error(exc):
+        return False
+    if isinstance(exc, EmptyCompletionError):
+        return True
+    if not getattr(exc, "_sotopia_request_error", False):
+        return False
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and (status >= 500 or status in _TRANSIENT_STATUS or status == 404):
+        return True
+    if isinstance(status, int) and 400 <= status < 500:
+        return _model_loading_error(exc)
+    if isinstance(exc, (TimeoutError, ConnectionError, asyncio.TimeoutError)):
+        return True
+    name = type(exc).__name__
+    if name in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "Timeout",
+        "InternalServerError",
+        "ServiceUnavailableError",
+        "BadGatewayError",
+        "RateLimitError",
+    }:
+        return True
+    return _transient_endpoint_error(exc)
+
+
+def is_permanent_request_error(exc: BaseException) -> bool:
+    """A request the server rejected and would reject again unchanged: HTTP 400 (a bad request, including a
+    prompt longer than the model's context window) that is not a transient model-loading message. The turn
+    is flagged as a failed request and also as permanent: the tournament runner reports it once and does
+    not replay the roster on every resume; the episode is still never rated."""
+    if is_model_output_error(exc) or not getattr(exc, "_sotopia_request_error", False):
+        return False
+    if is_retryable_request_error(exc):
+        return False
+    name = type(exc).__name__
+    return name in {"ContextWindowExceededError", "BadRequestError"} or getattr(exc, "status_code", None) == 400
+
+
+_SCHEMA_WORDS = ("response_schema", "response_format", "json_schema")
+
+
+def is_schema_rejection(exc: BaseException) -> bool:
+    """The structured-output request itself was refused: the capability check before the request, or an API
+    error (HTTP 400/422) whose message is about the response schema. This is the only case in which
+    agenerate_action plays the turn again without a schema. A model's reply never qualifies, whatever it
+    says: its errors are model output, not request errors."""
+    if is_model_output_error(exc):
+        return False
+    if isinstance(exc, StructuredOutputUnsupported):
+        return True
+    if not getattr(exc, "_sotopia_request_error", False):
+        return False
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422) and type(exc).__name__ not in {"BadRequestError", "UnsupportedParamsError"}:
+        return False
+    message = str(exc).lower()
+    return any(word in message for word in _SCHEMA_WORDS)
+
+
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _retry_wait(retry_index: int) -> float:
+    """Exponential backoff: SOTOPIA_ENDPOINT_RETRY_WAIT, doubled each retry, capped at
+    SOTOPIA_ENDPOINT_RETRY_MAX_WAIT."""
+    base = _env_number("SOTOPIA_ENDPOINT_RETRY_WAIT", DEFAULT_ENDPOINT_RETRY_WAIT)
+    cap = _env_number("SOTOPIA_ENDPOINT_RETRY_MAX_WAIT", DEFAULT_ENDPOINT_RETRY_MAX_WAIT)
+    return float(min(cap, base * (2**retry_index)))
+
+
+def _reasoning_of(response: Any) -> str | None:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return None
+    message = getattr(choices[0], "message", None)
+    return getattr(message, "reasoning_content", None) or getattr(
+        message, "reasoning", None
+    )
 
 
 @dataclass(frozen=True)
@@ -162,7 +395,11 @@ async def format_bad_output(
     if base_url is not None:
         completion_kwargs["base_url"] = base_url
 
-    response = await acompletion(**completion_kwargs)
+    try:
+        response = await acompletion(**completion_kwargs)
+    except Exception as exc:
+        _mark_request_error(exc)
+        raise
     reformatted_output = response.choices[0].message.content
     assert isinstance(reformatted_output, str)
     log.debug(f"Model: {model_name}")
@@ -182,6 +419,7 @@ async def agenerate(
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
     return_prompt_and_response: Literal[False] = False,
+    repair_bad_output: bool = True,
 ) -> OutputType: ...
 
 
@@ -196,6 +434,7 @@ async def agenerate(
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
     return_prompt_and_response: Literal[True] = ...,
+    repair_bad_output: bool = True,
 ) -> tuple[OutputType, list[dict[str, str]], str]: ...
 
 
@@ -211,8 +450,13 @@ async def agenerate(
     bad_output_process_model: str | None = None,
     use_fixed_model_version: bool = True,
     return_prompt_and_response: bool = False,
+    repair_bad_output: bool = True,
 ) -> OutputType | tuple[OutputType, list[dict[str, str]], str]:
-    """Generate text using LiteLLM instead of Langchain."""
+    """Generate text using LiteLLM instead of Langchain.
+
+    repair_bad_output: in the unstructured path, a reply that does not parse is sent to a second model call
+    (format_bad_output) to be reformatted. Game actions pass False (agenerate_action): a model's malformed
+    reply is its own move, so it is raised as model output with the raw reply attached, never repaired."""
     # Format template with input values
     if "format_instructions" not in input_values:
         input_values["format_instructions"] = output_parser.get_format_instructions()
@@ -235,6 +479,10 @@ async def agenerate(
         api_key = None
 
     cache_key = (model_name, base_url)
+    generation_options = _generation_options()
+    # Explicit per-agent settings take precedence over the helper's defaults.
+    if "temperature" in generation_options:
+        temperature = custom_temperature(generation_options["temperature"])
 
     supported_params: list[str] | None = None
     if base_url is None:
@@ -287,10 +535,62 @@ async def agenerate(
     async def _call_with_retry(completion_kwargs: dict[str, Any]) -> Any:
         nonlocal send_temperature
         call_kwargs = dict(completion_kwargs)
+        call_kwargs.update(generation_options)
+        call_kwargs.pop("temperature", None)
         if send_temperature:
             call_kwargs["temperature"] = effective_temperature
+        attempts: list[dict[str, Any]] = []
+
+        async def complete() -> Any:
+            # These are the kwargs sent to LiteLLM, not inferred server defaults.
+            options = deepcopy(
+                {k: v for k, v in call_kwargs.items() if k in _GENERATION_OPTION_KEYS}
+            )
+            attempt: dict[str, Any] = {
+                "effective_options": options,
+                "structured_output": "response_format" in call_kwargs,
+            }
+            started = time.perf_counter()
+            finish_reason = None
+            usage = None
+            error = None
+            try:
+                response = await acompletion(**call_kwargs)
+                choices = getattr(response, "choices", None)
+                if choices:
+                    finish_reason = getattr(choices[0], "finish_reason", None)
+                usage = getattr(response, "usage", None)
+                if hasattr(usage, "model_dump"):
+                    usage = usage.model_dump()
+                elif hasattr(usage, "dict"):
+                    usage = usage.dict()
+                return response
+            except Exception as exc:
+                error = {"type": type(exc).__name__, "message": str(exc)}
+                _mark_request_error(exc)
+                raise
+            finally:
+                attempt.update(
+                    elapsed_seconds=time.perf_counter() - started,
+                    finish_reason=finish_reason,
+                    usage=deepcopy(usage),
+                )
+                if error:
+                    attempt["error"] = error
+                attempts.append(attempt)
+                LAST_COMPLETION_METADATA.set(
+                    {
+                        "finish_reason": finish_reason,
+                        "usage": deepcopy(usage),
+                        "elapsed_seconds": sum(a["elapsed_seconds"] for a in attempts),
+                        "effective_options": options,
+                        "attempts": deepcopy(attempts),
+                        **({"error": error} if error else {}),
+                    }
+                )
+
         try:
-            response = await acompletion(**call_kwargs)
+            response = await complete()
             if send_temperature:
                 _TEMPERATURE_SUPPORT_CACHE[cache_key] = True
             return response
@@ -305,18 +605,17 @@ async def agenerate(
                         effective_temperature,
                     )
                 call_kwargs.pop("temperature", None)
-                return await acompletion(**call_kwargs)
+                return await complete()
             raise
 
     if structured_output:
         if not base_url:
             assert supported_params is not None
-            assert (
-                "response_format" in supported_params
-            ), "response_format is not supported in this model"
-            assert supports_response_schema(
-                model=model_name
-            ), "response_schema is not supported in this model"
+            # Checked before the request is sent; agenerate_action then plays the turn without a schema.
+            if "response_format" not in supported_params:
+                raise StructuredOutputUnsupported("response_format is not supported in this model")
+            if not supports_response_schema(model=model_name):
+                raise StructuredOutputUnsupported("response_schema is not supported in this model")
         messages = [{"role": "user", "content": template}]
 
         assert isinstance(
@@ -331,7 +630,15 @@ async def agenerate(
             api_key=api_key,
         )
         response = await _call_with_retry(completion_kwargs)
-        result = response.choices[0].message.content
+        LAST_REASONING.set(_reasoning_of(response))
+        try:
+            result = _content_or_raise(response, model_name)
+        except Exception as exc:
+            if is_model_output_error(exc):
+                _attach_reply(exc, messages, getattr(exc, "refusal", ""))
+            raise
+        result, inline_reasoning = _split_inline_think(result)
+        LAST_REASONING.set(_reasoning_of(response) or inline_reasoning)
         # Include agent name in logs if available
         agent_name = input_values.get("agent", "")
         log_prefix = f" [{agent_name}]" if agent_name else ""
@@ -344,7 +651,12 @@ async def agenerate(
             clean_result = re.sub(r"\s+", " ", clean_result)
         log.info(f"Generated result{log_prefix}: {clean_result}")
         assert isinstance(result, str)
-        parsed = cast(OutputType, output_parser.parse(result))
+        try:
+            parsed = cast(OutputType, output_parser.parse(result))
+        except Exception as exc:
+            _mark_model_output_error(exc)
+            _attach_reply(exc, messages, result)
+            raise
         if return_prompt_and_response:
             return parsed, messages, result
         return parsed
@@ -359,12 +671,21 @@ async def agenerate(
         api_key=api_key,
     )
     response = await _call_with_retry(completion_kwargs)
-    result = response.choices[0].message.content
+    LAST_REASONING.set(_reasoning_of(response))
+    try:
+        result = _content_or_raise(response, model_name)
+    except Exception as exc:
+        if is_model_output_error(exc):
+            _attach_reply(exc, messages, getattr(exc, "refusal", ""))
+        raise
 
     try:
         parsed_result = output_parser.parse(result)
     except Exception as e:
-        if isinstance(output_parser, ScriptOutputParser):
+        if isinstance(output_parser, ScriptOutputParser) or not repair_bad_output:
+            # The model's own move: never sent to a second call to be repaired.
+            _mark_model_output_error(e)
+            _attach_reply(e, messages, result)
             raise e
         log.debug(
             f"Failed to parse result: {result}\nEncounter Exception {e}\nstart to reparse",
@@ -378,7 +699,11 @@ async def agenerate(
             use_fixed_model_version,
             base_url=base_url,
         )
-        parsed_result = output_parser.parse(reformat_result)
+        try:
+            parsed_result = output_parser.parse(reformat_result)
+        except Exception as exc:
+            _mark_model_output_error(exc)
+            raise
 
     # Include agent name in logs if available
     agent_name = input_values.get("agent", "")
@@ -580,6 +905,113 @@ async def agenerate_action(
 ) -> tuple[AgentAction, list[dict[str, str]], str]: ...
 
 
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>\s*", re.DOTALL)
+
+
+def _split_inline_think(text: str) -> tuple[str, str | None]:
+    """Remove ``<think>...</think>`` blocks a model wrote inline and return them separately.
+
+    Models served without a reasoning parser (or prompted to reason in a scratchpad before the
+    JSON action) put their reasoning in the text itself; it is logged as the turn's reasoning
+    and kept out of the action parser.
+    """
+    blocks = _THINK_RE.findall(text)
+    if not blocks:
+        return text, None
+    return _THINK_RE.sub("", text).strip(), "\n\n".join(b.strip() for b in blocks)
+
+
+def _content_or_raise(response: Any, model_name: str) -> str:
+    """Return the completion text, or raise. The rule (see the comment above DEFAULT_ENDPOINT_RETRIES):
+
+    - A response with no choices (or a choice without a message), a generation the server aborted
+      (finish_reason 'abort' or 'error', even with partial text), or one with neither content nor a
+      finish reason did not complete: EmptyCompletionError, unmarked, so it is a request failure
+      (retried, and flagged if it persists).
+    - Otherwise the server completed the generation, and an unusable reply is the model's own move
+      (marked as model output: played as 'none', not retried, rated): a structured-output refusal
+      (content None, ``refusal`` set; ModelRefusalError keeps the text), or an empty or whitespace-only
+      reply whatever the finish reason ('stop', 'length' at the token limit, 'content_filter', ...).
+    """
+    choices = getattr(response, "choices", None)
+    if not choices or getattr(choices[0], "message", None) is None:
+        raise EmptyCompletionError(f"no choices in the completion from {model_name}", finish_reason=None)
+    choice = choices[0]
+    message = choice.message
+    content = getattr(message, "content", None)
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason in SERVER_ABORT_FINISH_REASONS:
+        raise EmptyCompletionError(
+            f"the server aborted the generation from {model_name} (finish_reason={finish_reason!r})",
+            finish_reason=finish_reason,
+        )
+    if isinstance(content, str) and content.strip():
+        return content
+    refusal = getattr(message, "refusal", None)
+    if isinstance(refusal, str) and refusal.strip():
+        refused = ModelRefusalError(
+            f"structured-output refusal from {model_name} (finish_reason={finish_reason!r}): {refusal}",
+            refusal=refusal,
+            finish_reason=finish_reason,
+        )
+        _mark_model_output_error(refused)
+        raise refused
+    exc = EmptyCompletionError(
+        f"empty completion from {model_name} (finish_reason={finish_reason!r})",
+        finish_reason=finish_reason,
+    )
+    if finish_reason is not None:
+        _mark_model_output_error(exc)
+    raise exc
+
+
+_MODEL_LOADING_WORDS = (
+    "no models loaded",
+    "unloaded",
+    "not loaded",
+    "model_not_found",
+    "crash",
+    "channel error",
+    "temporarily",
+)
+
+
+def _model_loading_error(e: BaseException) -> bool:
+    """A self-hosted server's message that its model is loading, unloaded or crashed (it may come with a 4xx)."""
+    msg = str(e).lower()
+    return any(k in msg for k in _MODEL_LOADING_WORDS)
+
+
+def _transient_endpoint_error(e: Exception) -> bool:
+    """Errors worth waiting out: a model server that is down or reloading, a dropped connection. Used only
+    for failed requests without an HTTP status (see is_retryable_request_error)."""
+    msg = str(e).lower()
+    return any(
+        k in msg
+        for k in (
+            "404",
+            "not found",
+            "connection",
+            "connect",
+            "timed out",
+            "timeout",
+            "502",
+            "503",
+            "500",
+            "server disconnected",
+            "temporarily",
+            "crash",
+            "channel error",
+            "model_not_found",
+            "no models loaded",
+            "unloaded",
+            "not loaded",
+            "empty completion",
+        )
+    )
+
+
 @gin.configurable
 @validate_call
 async def agenerate_action(
@@ -676,7 +1108,7 @@ async def agenerate_action(
         else:
             output_parser_obj = PydanticOutputParser(pydantic_object=AgentAction)
 
-        if return_prompt_and_response:
+        async def _call() -> Any:
             return await agenerate(
                 model_name=model_name,
                 template=template,
@@ -692,31 +1124,51 @@ async def agenerate_action(
                 structured_output=structured_output,
                 bad_output_process_model=bad_output_process_model,
                 use_fixed_model_version=use_fixed_model_version,
-                return_prompt_and_response=True,
+                return_prompt_and_response=return_prompt_and_response,
+                repair_bad_output=False,  # a malformed reply is the model's move, never repaired
             )
-        else:
-            return await agenerate(
-                model_name=model_name,
-                template=template,
-                input_values=dict(
-                    agent=agent,
-                    turn_number=str(turn_number),
-                    history=history,
-                    action_list=" ".join(action_types),
-                    goal=goal,
-                ),
-                output_parser=output_parser_obj,
-                temperature=temperature,
-                structured_output=structured_output,
-                bad_output_process_model=bad_output_process_model,
-                use_fixed_model_version=use_fixed_model_version,
-                return_prompt_and_response=False,
-            )
+
+        # Retry transient request failures (a dropped connection, a timeout, a server error, a
+        # self-hosted model that crashed and is being reloaded) with exponential backoff, on by
+        # default: SOTOPIA_ENDPOINT_RETRIES (default 6) retries, the first after
+        # SOTOPIA_ENDPOINT_RETRY_WAIT seconds (default 5), doubling up to
+        # SOTOPIA_ENDPOINT_RETRY_MAX_WAIT (default 60). A malformed model reply is not retried.
+        retries = int(_env_number("SOTOPIA_ENDPOINT_RETRIES", DEFAULT_ENDPOINT_RETRIES))
+        retry_errors: list[dict[str, str]] = []
+        for attempt in range(retries + 1):
+            try:
+                result = await _call()
+                meta = LAST_COMPLETION_METADATA.get() or {}
+                if retry_errors:
+                    meta = dict(meta)
+                    meta["request_errors"] = retry_errors
+                    LAST_COMPLETION_METADATA.set(meta)
+                log_progress_event(
+                    "call", model=model_name, ok=True, elapsed=meta.get("elapsed_seconds"), attempt=attempt
+                )
+                return result
+            except Exception as e:
+                if attempt < retries and is_retryable_request_error(e):
+                    wait = _retry_wait(attempt)
+                    retry_errors.append({"type": type(e).__name__, "message": str(e)[:500]})
+                    log.warning(
+                        f"Endpoint error for {model_name} ({str(e)[:160]}); retry {attempt + 1}/{retries} in {wait:.0f}s"
+                    )
+                    log_progress_event("call", model=model_name, ok=False, retry=True, error=str(e)[:200])
+                    await asyncio.sleep(wait)
+                    continue
+                if retry_errors:
+                    setattr(e, "_sotopia_retry_errors", retry_errors)
+                raise
     except Exception as e:
-        # If structured_output failed, retry without it
-        if structured_output and "response_schema" in str(e).lower():
+        # The API refused the response schema itself (or the model has none): play the turn without one.
+        # Only a request error about the schema qualifies (is_schema_rejection), never text in a reply; the
+        # unstructured call does not repair a malformed reply either (repair_bad_output=False above).
+        if structured_output and is_schema_rejection(e):
             log.info(f"Retrying without structured_output for model {model_name}")
-            return await agenerate_action(
+            previous_metadata = LAST_COMPLETION_METADATA.get() or {}
+            LAST_COMPLETION_METADATA.set(None)
+            fallback_result = await agenerate_action(
                 model_name=model_name,
                 history=history,
                 turn_number=turn_number,
@@ -732,9 +1184,40 @@ async def agenerate_action(
                 return_prompt_and_response=return_prompt_and_response,
                 structured_output=False,
             )
+            metadata = dict(LAST_COMPLETION_METADATA.get() or {})
+            attempts = previous_metadata.get("attempts", []) + metadata.get(
+                "attempts", []
+            )
+            metadata.update(
+                structured_output_fallback=True,
+                structured_output_error={"type": type(e).__name__, "message": str(e)[:500]},
+                attempts=attempts,
+                elapsed_seconds=sum(attempt["elapsed_seconds"] for attempt in attempts),
+            )
+            LAST_COMPLETION_METADATA.set(metadata)
+            return fallback_result
         log.warning(f"Failed to generate action due to {e}")
+        log_progress_event("call", model=model_name, ok=False, error=str(e)[:200])
+        metadata = dict(LAST_COMPLETION_METADATA.get() or {})
+        metadata["action_error"] = {"type": type(e).__name__, "message": str(e)}
+        # The turn is still played as 'none' so the episode runs on. A model's own reply is its move
+        # (request_failed False, rated). Anything else is flagged: calculate_elo drops such episodes, and
+        # run_elo_tournament replays their rosters on resume unless the failure is permanent (a 400 or a
+        # context-window error, which would fail again the same way).
+        model_move = is_model_output_error(e)
+        metadata["request_failed"] = not model_move
+        if not model_move and is_permanent_request_error(e):
+            metadata["permanent_failure"] = True
+        if isinstance(e, ModelRefusalError):
+            metadata["refusal"] = e.refusal
+        if getattr(e, "_sotopia_retry_errors", None):
+            metadata["request_errors"] = getattr(e, "_sotopia_retry_errors")
+        LAST_COMPLETION_METADATA.set(metadata)
         action = AgentAction(action_type="none", argument="")
         if return_prompt_and_response:
+            if model_move:
+                # Keep the model's raw reply (and the prompt) in the log; the error is in action_error.
+                return action, getattr(e, "_sotopia_prompt", []), getattr(e, "_sotopia_raw_reply", "")
             return action, [], str(e)
         return action
 

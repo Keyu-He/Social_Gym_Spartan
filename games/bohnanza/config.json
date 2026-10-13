@@ -1,0 +1,168 @@
+{
+    "scenario": "Bohnanza",
+    "description": "This game is called Bohnanza. Players: {agent_names}. Everyone is a bean farmer who plants beans, trades beans with the others, and harvests fields for gold coins. The player with the most coins at the end wins.\n\nCARDS: 130 bean cards of 10 varieties (the Coffee Bean of the 11-variety deck is not used with 4 players, as in the published rules). Each variety has a BEANOMETER: the number of beans of that variety you must harvest at once to earn 1/2/3/4 coins (a dash means that level does not exist). Wax (22 cards): 4/7/9/11; Blue (20 cards): 4/6/8/10; Chili (18 cards): 3/6/8/9; Stink (16 cards): 3/5/7/8; Green (14 cards): 3/5/6/7; Soy (12 cards): 2/4/6/7; Black-eyed (10 cards): 2/4/5/6; Red (8 cards): 2/3/4/5; Garden (6 cards): -/2/3/-; Cocoa (4 cards): -/2/3/4.\n\nHAND: you hold your cards in a FIXED ORDER. New cards go to the BACK of your hand and you may only PLANT the FRONT card; you may TRADE any card in your hand. Your hand is private; everyone's fields and coins are public.\n\nFIELDS: you start with 2 bean fields; a 3rd field costs 3 coins (paid once; write 'buy field' in any message you send). A field holds beans of ONE variety only. To plant a different variety into an occupied field you must harvest that field first. HARVEST: write 'harvest <field number>' in any message you send: you earn coins per the beanometer, the coin cards leave the game and the other harvested cards go to the discard pile. Bean protection: you may NOT harvest a field holding only 1 bean while another of your fields holds 2 or more.\n\nTURN STRUCTURE (players take turns in order):\n1. Plant: the active player MUST plant the front card of their hand and MAY plant the next card too. A plant command always plants the front card, into the field it names if planting there is legal (naming another card does not change which card is planted). If your reply plants no card legally, the engine plants your front card for you: into a field that already holds that variety, else an empty field, else it harvests the field that pays the most coins (bean protection respected) and plants there.\n2. Trade: the engine turns 2 cards from the draw pile face up for the active player. The active player may trade these 2 cards and any hand cards; the other players may trade cards from their hands, but ONLY with the active player. Each player speaks once, the active player first; then the active player accepts or declines the offers made to them. Gifts (giving a card for nothing) are trades too and need the receiver's consent. Cards received in a trade cannot be traded again: they must be planted.\n3. Plant traded cards: every player plants the cards they received; the active player also plants any face-up cards that were not traded away. Cards left unplanted are placed by the engine the same way.\n4. Draw: the active player draws 3 cards to the back of their hand. Then the next player's turn begins.\n\nGAME END: the game ends after {max_rounds} full rounds, or when the draw pile runs out (the current turn is then completed without drawing), whichever comes first. Everyone then harvests all their fields. Most coins wins, and every place counts: 1st +1, 2nd +1/3, 3rd -1/3, 4th -1. Equal coin totals are ranked by the number of cards left in hand, and players still equal share the places they span.\n\nOnly the moves your reply commits to count: an offer, accept, plant or harvest you mention while saying you will not do it, might do it, or will do it later does nothing ('I accept none of these offers' accepts nothing).",
+    "role_goals": {
+        "Player": "Finish the game with more coins than the other players. Plant so that your fields grow large before you harvest, and trade so that you are never forced to plant beans you do not want."
+    },
+    "role_secrets": {
+        "Player": "Your hand is private. Its order is fixed: you can only plant the front card, and new cards join at the back."
+    },
+    "beans": [
+        {
+            "name": "Coffee",
+            "count": 24,
+            "beanometer": [
+                4,
+                7,
+                10,
+                12
+            ]
+        },
+        {
+            "name": "Wax",
+            "count": 22,
+            "beanometer": [
+                4,
+                7,
+                9,
+                11
+            ]
+        },
+        {
+            "name": "Blue",
+            "count": 20,
+            "beanometer": [
+                4,
+                6,
+                8,
+                10
+            ]
+        },
+        {
+            "name": "Chili",
+            "count": 18,
+            "beanometer": [
+                3,
+                6,
+                8,
+                9
+            ]
+        },
+        {
+            "name": "Stink",
+            "count": 16,
+            "beanometer": [
+                3,
+                5,
+                7,
+                8
+            ]
+        },
+        {
+            "name": "Green",
+            "count": 14,
+            "beanometer": [
+                3,
+                5,
+                6,
+                7
+            ]
+        },
+        {
+            "name": "Soy",
+            "count": 12,
+            "beanometer": [
+                2,
+                4,
+                6,
+                7
+            ]
+        },
+        {
+            "name": "Black-eyed",
+            "count": 10,
+            "beanometer": [
+                2,
+                4,
+                5,
+                6
+            ]
+        },
+        {
+            "name": "Red",
+            "count": 8,
+            "beanometer": [
+                2,
+                3,
+                4,
+                5
+            ]
+        },
+        {
+            "name": "Garden",
+            "count": 6,
+            "beanometer": [
+                null,
+                2,
+                3,
+                null
+            ]
+        },
+        {
+            "name": "Cocoa",
+            "count": 4,
+            "beanometer": [
+                null,
+                2,
+                3,
+                4
+            ]
+        }
+    ],
+    "removed_varieties": [
+        "Coffee"
+    ],
+    "hand_size": 5,
+    "starting_fields": 2,
+    "max_fields": 3,
+    "third_field_cost": 3,
+    "max_rounds": 6,
+    "deck_exhaustions_to_end": 1,
+    "initial_state": "Plant",
+    "state_transition": {
+        "Plant": "Trade",
+        "Trade": "Resolve",
+        "Resolve": "Plant_traded",
+        "Plant_traded": "Plant"
+    },
+    "state_properties": {
+        "Plant": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        },
+        "Trade": {
+            "actions": [
+                "speak"
+            ],
+            "action_order": "round-robin",
+            "visibility": "public"
+        },
+        "Resolve": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        },
+        "Plant_traded": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        }
+    }
+}

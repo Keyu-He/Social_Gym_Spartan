@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -50,13 +51,22 @@ class RPSEvaluator(SocialGameEndEvaluator):
     def __call__(
         self, turn_number: int, messages: List[Tuple[str, Message]], **kwargs: Any
     ) -> List[Tuple[str, Tuple[Tuple[str, int | float | bool], str]]]:
-        if turn_number >= self.max_turn_number:
-            env = kwargs.get("env")
+        env = kwargs.get("env")
+        # The match ends when its rounds are played, not after a fixed number of env steps:
+        # a re-asked player takes one extra step in that round.
+        max_rounds = env._config.get("max_rounds", 10) if env else 10
+        rounds_done = env.internal_state.get("round", 0) if env else 0
+        if rounds_done >= max_rounds or turn_number >= self.max_turn_number:
             if env:
                 scores = env.internal_state.get("scores", {})
                 response: List[
                     Tuple[str, Tuple[Tuple[str, int | float | bool], str]]
-                ] = [("environment", (("terminated", True), "Max (10) turns reached"))]
+                ] = [
+                    (
+                        "environment",
+                        (("terminated", True), f"All {rounds_done} rounds played"),
+                    )
+                ]
 
                 agent_names = list(env.agents)
                 scores_dict = {name: scores.get(name, 0) for name in agent_names}
@@ -99,29 +109,66 @@ class RPSEvaluator(SocialGameEndEvaluator):
 # ============================================================================
 
 
+MOVES = ("Rock", "Paper", "Scissors")
+# Singular and plural are the same throw ("rocks", "papers", "scissor").
+MOVE_WORDS = {
+    "Rock": ("rock", "rocks"),
+    "Paper": ("paper", "papers"),
+    "Scissors": ("scissors", "scissor"),
+}
+
+
+# A move word right after a negation in its clause ("I will not swerve", "don't defect") does not name that move.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def names(text: str, word: str) -> bool:
+    """True when `text` uses `word` as a whole word at least once with no negation right before it."""
+    return any(not is_negated(text, m.start()) for m in re.finditer(rf"\b{word}\b", text))
+
+
+def read_move(argument: str) -> str | None:
+    """The throw a reply names, when it names exactly one of the three as a word, else None.
+
+    Whole words only ("paperwork" is not paper), and a negated throw is not named, so "not rock, paper"
+    is Paper. A reply naming two throws ("rock beats scissors so I play paper") or none ("not rock") is
+    not read as a move; the player is asked again.
+    """
+    text = argument.lower().replace("’", "'")
+    named = [move for move, words in MOVE_WORDS.items() if any(names(text, w) for w in words)]
+    return named[0] if len(named) == 1 else None
+
+
 class RPSActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
-        if isinstance(env, RPSEnv) and action.action_type in ["action", "speak"]:
-            tokens = re.findall(r"[a-z]+", action.argument.lower())
-            current_move = None
-            # First-matching token wins; strict equality avoids "paperwork" -> Paper.
-            for tok in tokens:
-                if tok == "rock":
-                    current_move = "Rock"
-                    break
-                if tok == "paper":
-                    current_move = "Paper"
-                    break
-                if tok in ("scissors", "scissor"):
-                    current_move = "Scissors"
-                    break
-            if current_move:
-                env.internal_state["current_moves"][agent_name] = current_move
+        if not isinstance(env, RPSEnv) or agent_name not in env.awaiting():
+            return
+        move = (
+            read_move(action.argument)
+            if action.action_type in ["action", "speak"]
+            else None
+        )
+        env.take_reply(agent_name, move)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
-        return "You are playing Rock-Paper-Scissors. Choose 'action: rock', 'action: paper', or 'action: scissors'. You cannot speak."
+        text = "You are playing Rock-Paper-Scissors. Choose 'action: rock', 'action: paper', or 'action: scissors'. You cannot speak."
+        if env.internal_state.get("unclear", {}).get(agent_name):
+            text += (
+                " Your last reply did not name exactly one of 'rock', 'paper' or 'scissors', so you are asked again."
+                " If this reply is also unclear, your throw is drawn at random."
+            )
+        return text
 
 
 # ============================================================================
@@ -151,34 +198,73 @@ class RPSEnv(SocialDeductionGame):
             lite=lite,
             include_background_observations=include_background_observations,
         )
-        self.internal_state = {"round": 0, "scores": {}, "current_moves": {}}
+        self.internal_state = {
+            "round": 0,
+            "scores": {},
+            "current_moves": {},
+            "unclear": {},
+            "drawn": [],
+        }
         for agent in self.agents:
             self.internal_state["scores"][agent] = 0
+        # Throws drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         return obs
 
-    async def astep(
-        self, actions: Dict[str, AgentAction] | Dict[str, Dict[str, int | str]]
-    ) -> Tuple[
-        Dict[str, Any],
-        Dict[str, float],
-        Dict[str, bool],
-        Dict[str, bool],
-        Dict[str, Any],
-    ]:
-        # Clear stale moves before processing this turn.
-        self.internal_state["current_moves"] = {}
+    def awaiting(self) -> List[str]:
+        """Players whose throw for the current round is not in yet (both, at the start of a round)."""
+        moves = self.internal_state.get("current_moves", {})
+        return [a for a in self.agents if a not in moves]
 
-        if self.action_handler:
-            for agent_name, action in actions.items():
-                if isinstance(action, AgentAction):
-                    self.action_handler.handle_action(self, agent_name, action)
+    def take_reply(self, agent_name: str, move: str | None) -> None:
+        """Hold a clear throw; ask an unclear (or failed) reply once more, then draw the throw at random.
 
-        # Default-and-continue: missing actions get the safe default so the
-        # round always resolves and no stale state persists to the next astep.
+        Throws stay hidden until the round is complete: the state is private, so a player asked
+        again never sees the other player's reply.
+        """
+        if move is not None:
+            self.internal_state["current_moves"][agent_name] = move
+            return
+        unclear = self.internal_state.setdefault("unclear", {})
+        unclear[agent_name] = unclear.get(agent_name, 0) + 1
+        round_num = self.internal_state.get("round", 0) + 1
+        if unclear[agent_name] == 1:
+            message = (
+                f"[Round {round_num}] {agent_name}'s reply did not name exactly one of 'rock', 'paper' or "
+                f"'scissors', so {agent_name} is asked again. Throws stay hidden until the round is complete."
+            )
+        else:
+            self.internal_state["current_moves"][agent_name] = self._fallback_rng.choice(MOVES)
+            self.internal_state.setdefault("drawn", []).append(agent_name)
+            message = (
+                f"[Round {round_num}] {agent_name}'s second reply was also unclear, "
+                f"so {agent_name}'s throw is drawn at random."
+            )
+        self.recv_message("Environment", SimpleMessage(message=message))
+
+    def _update_action_mask(self) -> None:
+        super()._update_action_mask()
+        if "current_moves" in self.internal_state:
+            due = self.awaiting()
+            self.action_mask = [a in due for a in self.agents]
+
+    def _should_transition_state(self) -> bool:
+        # "Entering state: Round" only when a new round starts: not while a player is asked again, and not after
+        # the last round.
+        if (
+            self.internal_state.get("current_moves")
+            or self.internal_state.get("unclear")
+            or self.internal_state.get("round", 0) >= self._config.get("max_rounds", 10)
+        ):
+            return False
+        return super()._should_transition_state()
+
+    def _check_eliminations(self) -> None:
+        if self.awaiting():
+            return  # someone is being asked again; the round resolves once every throw is in
         moves = self.internal_state["current_moves"]
-        for agent in self.agents:
-            moves.setdefault(agent, "Rock")
-        if len(moves) == len(self.agents) and len(self.agents) == 2:
+        drawn = self.internal_state.get("drawn", [])
+        if len(self.agents) == 2:
             agents = list(self.agents)
             a1, a2 = agents[0], agents[1]
             m1, m2 = moves[a1], moves[a2]
@@ -195,19 +281,23 @@ class RPSEnv(SocialDeductionGame):
             else:
                 winner = a2
 
-            r1, r2 = (1, -1) if winner == a1 else (-1, 1) if winner == a2 else (0, 0)
+            # The round winner gets a point and the loser none, as the rules text says.
+            r1, r2 = (1, 0) if winner == a1 else (0, 1) if winner == a2 else (0, 0)
             result = f"{winner} wins!" if winner else "Draw"
 
             self.internal_state["scores"][a1] += r1
             self.internal_state["scores"][a2] += r2
 
-            msg = f"Round {self.internal_state['round']+1}: {a1} ({m1}) vs {a2} ({m2}) -> {result}"
+            def shown(name: str, move: str) -> str:
+                return f"{move}, drawn at random" if name in drawn else move
+
+            msg = f"Round {self.internal_state['round']+1}: {a1} ({shown(a1, m1)}) vs {a2} ({shown(a2, m2)}) -> {result}"
             self.recv_message("Environment", SimpleMessage(message=msg))
 
             self.internal_state["round"] += 1
             self.internal_state["current_moves"] = {}
-
-        return await super().astep(actions)
+            self.internal_state["unclear"] = {}
+            self.internal_state["drawn"] = []
 
 
 # ============================================================================
@@ -249,7 +339,8 @@ def create_environment(
         config=config,
         model_name=model_name,
         # action_order is handled by config state_properties
-        evaluators=[RPSEvaluator(max_turn_number=10)],
+        # Safety cap only: every round takes one step, or two when a player is asked again.
+        evaluators=[RPSEvaluator(max_turn_number=2 * config.get("max_rounds", 10))],
         terminal_evaluators=[],
         hide_unknown=True,
     )

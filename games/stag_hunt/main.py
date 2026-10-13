@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -26,6 +27,7 @@ from sotopia.envs.social_game import (
     SocialDeductionGame,
     SOCIAL_GAME_PROMPT_TEMPLATE,
     load_config,
+    rank_split_rewards,
 )
 from sotopia.messages import AgentAction, Message, Observation, SimpleMessage
 from sotopia.server import arun_one_episode
@@ -60,23 +62,89 @@ class StagHuntEvaluator(SocialGameEndEvaluator):
         return [("environment", (("terminated", False), ""))]
 
 
+_NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+_ORDINALS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th", 6: "6th"}
+
+
+def _tie_example(totals: List[int]) -> str:
+    """What `rank_split_rewards` gives these totals, in words ("the player on 30 wins, ...")."""
+    rewards = rank_split_rewards({str(i): t for i, t in enumerate(totals)})
+    verbs = {1.0: ("wins", "win"), 0.0: ("draws", "draw"), -1.0: ("loses", "lose")}
+    parts = []
+    for total in sorted(set(totals), reverse=True):
+        count = totals.count(total)
+        verb = verbs[rewards[str(totals.index(total))]][0 if count == 1 else 1]
+        who = "the player" if count == 1 else f"the {_NUMBER_WORDS[count]} players"
+        parts.append(f"{who} on {total} {verb}")
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def tie_rule(n: int) -> str:
+    """How `rank_split_rewards` treats equal totals at an n-player table, with two worked examples."""
+    k = n // 2
+    other = (
+        f"one that holds {_ORDINALS[k + 1]} place or straddles the line between winners and losers"
+        if n % 2
+        else f"one that straddles the line between {_ORDINALS[k]} and {_ORDINALS[k + 1]} place"
+    )
+    a = [30] * (k + 1) + [12] * (n - k - 1)
+    b = [30, 20, 20] + [12] * (n - 3)
+    return (
+        f"Players with equal totals share one result: a tied group that lies entirely within the top {k} places "
+        f"wins, one that lies entirely within the bottom {k} places loses, and any other tied group ({other}) draws. "
+        f"For example, with totals {', '.join(map(str, a))}, {_tie_example(a)}; with totals "
+        f"{', '.join(map(str, b))}, {_tie_example(b)}."
+    )
+
+
+MOVES = ("stag", "hare")
+# Singular and plural name the same hunt ("stags", "hares").
+MOVE_WORDS = {"stag": ("stag", "stags"), "hare": ("hare", "hares")}
+
+
+# A move word right after a negation in its clause ("I will not swerve", "don't defect") does not name that move.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def names(text: str, word: str) -> bool:
+    """True when `text` uses `word` as a whole word at least once with no negation right before it."""
+    return any(not is_negated(text, m.start()) for m in re.finditer(rf"\b{word}\b", text))
+
+
+def read_move(argument: str) -> str | None:
+    """'stag' or 'hare' when the reply names exactly one of them as a word, else None.
+
+    A negated move is not named, so "not hare, stag" is stag. A reply naming both ("hare is safe but I
+    pick stag") or neither ("I won't hunt stag") is not read as a move; the player is asked again.
+    """
+    text = argument.lower().replace("’", "'")
+    named = [move for move, words in MOVE_WORDS.items() if any(names(text, w) for w in words)]
+    return named[0] if len(named) == 1 else None
+
+
 class StagHuntActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
         if not isinstance(env, StagHuntEnv):
             return
-        if action.action_type not in ["action", "speak"]:
+        if env.current_state != "Choose" or agent_name not in env.awaiting():
             return
-        if env.current_state == "Choose":
-            tokens = re.findall(r"[a-z]+", action.argument.lower())
-            for tok in tokens:
-                if tok == "stag":
-                    env.internal_state["current_moves"][agent_name] = "stag"
-                    break
-                if tok == "hare":
-                    env.internal_state["current_moves"][agent_name] = "hare"
-                    break
+        move = (
+            read_move(action.argument)
+            if action.action_type in ["action", "speak"]
+            else None
+        )
+        env.take_reply(agent_name, move)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, StagHuntEnv):
@@ -85,12 +153,19 @@ class StagHuntActionHandler(ActionHandler):
             round_num = env.internal_state.get("round", 0) + 1
             max_rounds = env._config.get("max_rounds", 10)
             scores = env.internal_state.get("scores", {})
-            return (
+            text = (
                 f"Round {round_num}/{max_rounds}. Scores: {scores}. "
                 f"Choose 'stag' or 'hare'. "
                 f"All stag=5 each. Any hare: stag=0, hare=2. "
-                f"Higher total score wins."
+                f"Players in the top half by total score win; players in the bottom half "
+                f"lose. {tie_rule(len(env.agents))}"
             )
+            if env.internal_state.get("unclear", {}).get(agent_name):
+                text += (
+                    " Your last reply did not name exactly one of 'stag' or 'hare', so you are asked again."
+                    " If this reply is also unclear, your move is drawn at random."
+                )
+            return text
         return ""
 
 
@@ -119,22 +194,59 @@ class StagHuntEnv(SocialDeductionGame):
             "round": 0,
             "scores": {name: 0 for name in self.agents},
             "current_moves": {},
+            "unclear": {},
+            "drawn": [],
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Moves drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         return obs
 
-    def _check_eliminations(self) -> None:
-        if not self._should_transition_state():
-            return
+    def awaiting(self) -> List[str]:
+        """Players whose move for the current round is not in yet (everyone, at the start of a round)."""
+        moves = self.internal_state.get("current_moves", {})
+        return [a for a in self.agents if a not in moves]
 
-        if self.current_state == "Choose":
-            moves = self.internal_state.setdefault("current_moves", {})
-            # Default-and-continue: unparsed actions default to the cooperative
-            # choice so the round always resolves with no stale carry-over.
-            for agent in self.agents:
-                moves.setdefault(agent, "stag")
+    def take_reply(self, agent_name: str, move: str | None) -> None:
+        """Hold a clear move; ask an unclear (or failed) reply once more, then draw the move at random.
+
+        Moves stay hidden until the round is complete: the Choose state is private, so a player
+        asked again never sees another player's reply, and no reply text reaches the others.
+        """
+        if move is not None:
+            self.internal_state["current_moves"][agent_name] = move
+            return
+        unclear = self.internal_state.setdefault("unclear", {})
+        unclear[agent_name] = unclear.get(agent_name, 0) + 1
+        round_num = self.internal_state.get("round", 0) + 1
+        if unclear[agent_name] == 1:
+            message = (
+                f"[Round {round_num}] {agent_name}'s reply did not name exactly one of 'stag' or 'hare', "
+                f"so {agent_name} is asked again. Moves stay hidden until the round is complete."
+            )
+        else:
+            self.internal_state["current_moves"][agent_name] = (
+                self._fallback_rng.choice(MOVES)
+            )
+            self.internal_state.setdefault("drawn", []).append(agent_name)
+            message = (
+                f"[Round {round_num}] {agent_name}'s second reply was also unclear, "
+                f"so {agent_name}'s move is drawn at random."
+            )
+        self.recv_message("Environment", SimpleMessage(message=message))
+
+    def _update_action_mask(self) -> None:
+        super()._update_action_mask()
+        if self.current_state == "Choose" and "current_moves" in self.internal_state:
+            due = self.awaiting()
+            self.action_mask = [a in due for a in self.agents]
+
+    def _check_eliminations(self) -> None:
+        if self.current_state == "Choose" and not self.awaiting():
+            moves = self.internal_state["current_moves"]
+            drawn = self.internal_state.get("drawn", [])
             scores = self.internal_state["scores"]
             all_stag = all(m == "stag" for m in moves.values())
 
@@ -147,8 +259,13 @@ class StagHuntEnv(SocialDeductionGame):
             round_num = self.internal_state["round"] + 1
             self.internal_state["round"] = round_num
             self.internal_state["current_moves"] = {}
+            self.internal_state["unclear"] = {}
+            self.internal_state["drawn"] = []
 
-            move_str = ", ".join(f"{n}: {m}" for n, m in moves.items())
+            move_str = ", ".join(
+                f"{n}: {moves[n]}" + (" (drawn at random)" if n in drawn else "")
+                for n in self.agents
+            )
             self.recv_message(
                 "Environment",
                 SimpleMessage(
@@ -160,25 +277,7 @@ class StagHuntEnv(SocialDeductionGame):
 
             max_rounds = self._config.get("max_rounds", 10)
             if round_num >= max_rounds:
-                max_score = max(scores.values())
-                min_score = min(scores.values())
-                if max_score == min_score:
-                    final = {n: 0.0 for n in scores}
-                else:
-                    sorted_names = sorted(
-                        scores.keys(), key=lambda n: scores[n], reverse=True
-                    )
-                    n_total = len(sorted_names)
-                    top_half = set(sorted_names[: n_total // 2])
-                    bot_half = set(sorted_names[n_total - n_total // 2 :])
-                    final = {}
-                    for name in sorted_names:
-                        if name in top_half:
-                            final[name] = 1.0
-                        elif name in bot_half:
-                            final[name] = -1.0
-                        else:
-                            final[name] = 0.0
+                final = rank_split_rewards(scores)
                 reason = f"Game over after {max_rounds} rounds. Final scores: {scores}"
 
                 self.internal_state["game_over"] = True
@@ -221,7 +320,10 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[StagHuntEvaluator(max_turn_number=10)],
+        # Safety cap only: every round takes one step, or two when a player is asked again.
+        evaluators=[
+            StagHuntEvaluator(max_turn_number=2 * config.get("max_rounds", 10))
+        ],
         terminal_evaluators=[],
         hide_unknown=True,
     )

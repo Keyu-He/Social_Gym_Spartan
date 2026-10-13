@@ -1,6 +1,6 @@
 {
   "scenario": "Coup",
-  "description": "This game is called Coup, a bluffing game. Each player has 2 hidden influence cards and 2 coins. On your turn, declare an action (some claim a role). Others can challenge your claim or block. Caught bluffing = lose a life (reveal a card). Wrong challenge = challenger loses a life. Last player standing wins.\n\nACTIONS:\n- 'income': Take 1 coin. Cannot be challenged or blocked.\n- 'foreign_aid': Take 2 coins. Can be blocked by Duke.\n- 'tax': Claim Duke, take 3 coins. Can be challenged.\n- 'steal NAME': Claim Captain, take 2 coins from NAME. Can be challenged. Can be blocked by Captain or Ambassador.\n- 'assassinate NAME': Claim Assassin, pay 3 coins, target loses a life. Can be challenged. Can be blocked by Contessa.\n- 'exchange': Claim Ambassador, draw 2 cards from court deck. If unchallenged or you win the challenge, you then enter a Choose phase: from your hand + the 2 drawn cards (3 or 4 cards total), choose which N to keep (where N is your current number of influence cards). Use 'keep CARD' (1 influence) or 'keep CARD1 CARD2' (2 influence). Returned cards go back to the deck. Can be challenged.\n- 'coup NAME': Pay 7 coins, target loses a life. Cannot be challenged or blocked. MANDATORY if you have 10+ coins.\n\nRESPONSE PHASE: After a declaration, other players choose 'challenge', 'block', or 'pass'.\n- If challenged: declarer proves they have the claimed card. If they do, challenger loses a life. If not, declarer loses a life and action cancelled.\n- If blocked (no challenge): action cancelled.\n- If all pass: action takes effect.\n\nCard types: Duke, Assassin, Captain, Ambassador, Contessa (3 copies each, 15 total). Lose both cards = eliminated.\n\nPlayers: {agent_names}.",
+  "description": "This game is called Coup, a bluffing game. Each player has 2 hidden influence cards and 2 coins. On your turn, declare an action (some claim a role). Others can challenge your claim or block. Caught bluffing = lose a life (reveal a card). Wrong challenge = challenger loses a life. Last player standing wins.\n\nACTIONS:\n- 'income': Take 1 coin. Cannot be challenged or blocked.\n- 'foreign_aid': Take 2 coins. Claims no role, so it cannot be challenged. Any other player can block it by claiming Duke.\n- 'tax': Claim Duke, take 3 coins. Can be challenged.\n- 'steal NAME': Claim Captain, take 2 coins from NAME. Can be challenged. Only NAME can block it, by claiming Captain or Ambassador.\n- 'assassinate NAME': Claim Assassin, pay 3 coins, target loses a life. Can be challenged. Only NAME can block it, by claiming Contessa. The 3 coins are paid when you declare: a successful challenge returns them, a block does not.\n- 'exchange': Claim Ambassador, draw 2 cards from court deck. If unchallenged or you win the challenge, you then enter a Choose phase: from your hand + the 2 drawn cards (3 or 4 cards total), choose which N to keep (where N is your current number of influence cards). Use 'keep CARD' (1 influence) or 'keep CARD1 CARD2' (2 influence). Returned cards go back to the deck. A reply that does not name exactly N of the offered cards keeps your original cards, and the table is told. Can be challenged.\n- 'coup NAME': Pay 7 coins, target loses a life. Cannot be challenged or blocked. MANDATORY if you have 10+ coins.\n\nRESPONSE PHASE: After a declaration, other players choose 'challenge', 'block', or 'pass'. Only role claims can be challenged, and only the blockers named above can block; any other challenge or block, any other answer, and a reply that commits to two different answers count as a pass. A block claiming a role that cannot block that action (say, Contessa against a steal) is announced as an invalid block and counts as no block. A challenge is settled before a block. If several players challenge (or block) at once, the first one clockwise from the declarer does.\n- If challenged: declarer proves they have the claimed card. If they do, challenger loses a life, the declarer shuffles that card back and draws a new one, and the action goes on (it can still be blocked; a target who challenged a steal or an assassination and lost is then asked whether it blocks, 'block' or 'pass'). If not, declarer loses a life and action cancelled.\n- If blocked: any player other than the blocker may then 'challenge' the block or 'pass' (if several challenge, the declarer does, else the first one clockwise from it). If nobody challenges, the action is cancelled. If the blocker has the claimed card, the challenger loses a life and the action is cancelled; if not, the blocker loses a life and the action takes effect. To block a steal you may name the role you claim ('block Captain' or 'block Ambassador'); a block naming neither claims both.\n- If all pass: action takes effect.\n\nLOSING A LIFE: whenever you lose a life you choose which of your cards to reveal and lose: reply 'lose CARD'. A reply that names none of your cards, or two different cards to lose, loses one drawn at random.\n\nOnly the move your reply commits to counts: a move you mention while saying you will not make it, might make it, or will make it on a later turn does not count ('I won't challenge; pass' is a pass, 'income now, coup Bob later' is income).\n\nCard types: Duke, Assassin, Captain, Ambassador, Contessa (3 copies each, 15 total). Lose both cards = eliminated.\n\nPlayers: {agent_names}.",
   "role_goals": {
     "Player": "Be the last player with influence remaining. Bluff strategically, challenge wisely, and eliminate your opponents."
   },
@@ -10,11 +10,15 @@
   "card_types": ["Duke", "Assassin", "Captain", "Ambassador", "Contessa"],
   "cards_per_type": 3,
   "starting_coins": 2,
+  "turn_limit": 50,
   "initial_state": "Declare",
   "state_transition": {
     "Declare": "Response",
     "Response": "Declare",
-    "Choose": "Declare"
+    "BlockChallenge": "Declare",
+    "Lose": "Declare",
+    "Choose": "Declare",
+    "Block": "Declare"
   },
   "state_properties": {
     "Declare": {
@@ -27,10 +31,25 @@
       "action_order": "simultaneous",
       "visibility": "public"
     },
+    "BlockChallenge": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "public"
+    },
+    "Lose": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "private"
+    },
     "Choose": {
       "actions": ["action"],
       "action_order": "simultaneous",
       "visibility": "private"
+    },
+    "Block": {
+      "actions": ["action"],
+      "action_order": "simultaneous",
+      "visibility": "public"
     }
   },
   "end_conditions": [],

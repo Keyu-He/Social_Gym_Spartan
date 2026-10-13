@@ -1,8 +1,8 @@
 {
     "scenario": "Chicken",
-    "description": "Two players play Chicken (Hawk-Dove) for exactly 10 rounds. You cannot speak to the other player. Each round, simultaneously choose 'swerve' or 'straight'. Both swerve = 3 each. One swerves, one goes straight = 1 for swerver, 5 for straight. Both straight = 0 each (crash!). GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Players: {agent_names}.",
+    "description": "Two players play Chicken (Hawk-Dove) for exactly 10 rounds. You cannot speak to the other player. Each round, simultaneously choose 'swerve' or 'straight'. Both swerve = 3 each. One swerves, one goes straight = 1 for swerver, 5 for straight. Both straight = 0 each (crash!). GOAL: Maximize your own score over the 10 rounds. The player with the higher total score wins. Equal totals are a draw. Unclear replies: a reply that does not name exactly one of 'swerve' or 'straight' (a move word right after a negation, as in 'I will not swerve', does not name that move), or that fails, is announced to both players and that player is asked once more, while the other move stays hidden; if the second reply is also unclear, that player's move is drawn at random, each move equally likely. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own score over 10 rounds. Higher total score wins."
+        "Player": "Maximize your own score over 10 rounds. Higher total score wins. Equal totals are a draw."
     },
     "role_secrets": {},
     "payoff_matrix": {
@@ -15,6 +15,6 @@
         "Choose": "Choose"
     },
     "state_properties": {
-        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import random
 import re
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -26,6 +28,7 @@ from sotopia.envs.social_game import (
     SocialDeductionGame,
     SOCIAL_GAME_PROMPT_TEMPLATE,
     load_config,
+    rank_split_rewards,
 )
 from sotopia.messages import AgentAction, Message, Observation, SimpleMessage
 from sotopia.server import arun_one_episode
@@ -60,21 +63,105 @@ class PublicGoodsEvaluator(SocialGameEndEvaluator):
         return [("environment", (("terminated", False), ""))]
 
 
+_NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+_ORDINALS = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th", 6: "6th"}
+
+
+def _tie_example(totals: List[int]) -> str:
+    """What `rank_split_rewards` gives these totals, in words ("the player on 30 wins, ...")."""
+    rewards = rank_split_rewards({str(i): t for i, t in enumerate(totals)})
+    verbs = {1.0: ("wins", "win"), 0.0: ("draws", "draw"), -1.0: ("loses", "lose")}
+    parts = []
+    for total in sorted(set(totals), reverse=True):
+        count = totals.count(total)
+        verb = verbs[rewards[str(totals.index(total))]][0 if count == 1 else 1]
+        who = "the player" if count == 1 else f"the {_NUMBER_WORDS[count]} players"
+        parts.append(f"{who} on {total} {verb}")
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def tie_rule(n: int) -> str:
+    """How `rank_split_rewards` treats equal totals at an n-player table, with two worked examples."""
+    k = n // 2
+    other = (
+        f"one that holds {_ORDINALS[k + 1]} place or straddles the line between winners and losers"
+        if n % 2
+        else f"one that straddles the line between {_ORDINALS[k]} and {_ORDINALS[k + 1]} place"
+    )
+    a = [30] * (k + 1) + [12] * (n - k - 1)
+    b = [30, 20, 20] + [12] * (n - 3)
+    return (
+        f"Players with equal totals share one result: a tied group that lies entirely within the top {k} places "
+        f"wins, one that lies entirely within the bottom {k} places loses, and any other tied group ({other}) draws. "
+        f"For example, with totals {', '.join(map(str, a))}, {_tie_example(a)}; with totals "
+        f"{', '.join(map(str, b))}, {_tie_example(b)}."
+    )
+
+
+_AMOUNT = r"[-+]?\d+(?:\.\d+)?"
+
+
+# An amount right after a negation in its clause ("I won't contribute 5") is not the contribution.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def read_contribution(argument: str, tokens: int = 10) -> int | None:
+    """The tokens contributed, or None when the reply is unclear.
+
+    The amount is the number after 'contribute' ("In round 3 I contribute 7" is 7), and a negated one
+    ("I won't contribute 5") does not count; a reply without 'contribute' must hold exactly one number ("7").
+    Two different amounts, no amount, a fraction of a token, or an amount outside 0..tokens is unclear,
+    so the player is asked again instead of having the amount clamped.
+    """
+    text = argument.lower().replace("’", "'")
+    stated = [
+        (m.group(1), m.start()) for m in re.finditer(rf"\bcontribut\w*\s*[:=]?\s*({_AMOUNT})", text)
+    ]
+    if stated:
+        values = {float(v) for v, at in stated if not is_negated(text, at)}
+    else:
+        values = {float(v) for v in re.findall(_AMOUNT, text)}
+    if len(values) != 1:
+        return None
+    value = values.pop()
+    if value != int(value) or not 0 <= value <= tokens:
+        return None
+    return int(value)
+
+
+def amount(x: Fraction | int | float) -> str:
+    """Display an exact amount, rounded to 3 decimals (exact for this game's eighths of a token)."""
+    return f"{float(x):.3f}".rstrip("0").rstrip(".")
+
+
+def amounts(values: Dict[str, Any]) -> str:
+    return "{" + ", ".join(f"'{n}': {amount(v)}" for n, v in values.items()) + "}"
+
+
 class PublicGoodsActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
         if not isinstance(env, PublicGoodsEnv):
             return
-        if action.action_type not in ["action", "speak"]:
+        if env.current_state != "Contribute" or agent_name not in env.awaiting():
             return
-        if env.current_state == "Contribute":
-            arg = action.argument.strip()
-            numbers = re.findall(r"\d+", arg)
-            if numbers:
-                amount = int(numbers[0])
-                amount = max(0, min(10, amount))
-                env.internal_state["current_contributions"][agent_name] = amount
+        tokens = env._config.get("tokens_per_round", 10)
+        read = (
+            read_contribution(action.argument, tokens)
+            if action.action_type in ["action", "speak"]
+            else None
+        )
+        env.take_reply(agent_name, read)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, PublicGoodsEnv):
@@ -94,12 +181,19 @@ class PublicGoodsActionHandler(ActionHandler):
                 )
             num_players = len(env.agents)
             top_n = num_players // 2
-            return (
-                f"Round {round_num}/{max_rounds}. Earnings: {scores}.{contrib_info} "
+            text = (
+                f"Round {round_num}/{max_rounds}. Earnings: {amounts(scores)}.{contrib_info} "
                 f"Contribute 0-10 tokens. Use 'contribute N'. "
                 f"Pool = total x {multiplier}, split equally. You keep uncontributed tokens. "
-                f"Top {top_n} earners WIN, bottom {top_n} LOSE. Relative ranking matters."
+                f"Top {top_n} earners WIN, bottom {top_n} LOSE. Relative ranking matters. {tie_rule(num_players)}"
             )
+            if env.internal_state.get("unclear", {}).get(agent_name):
+                text += (
+                    " Your last reply did not give one whole number of tokens from 0 to 10, so you are asked again."
+                    " Reply 'contribute N' with N a whole number from 0 to 10."
+                    " If this reply is also unclear, your contribution is drawn at random from 0 to 10."
+                )
+            return text
         return ""
 
 
@@ -126,82 +220,117 @@ class PublicGoodsEnv(SocialDeductionGame):
         )
         self.internal_state = {
             "round": 0,
-            "scores": {name: 0.0 for name in self.agents},
+            # Exact earnings (shares are eighths of a token); only the messages round them.
+            "scores": {name: Fraction(0) for name in self.agents},
             "current_contributions": {},
+            "unclear": {},
+            "drawn": [],
             "last_contributions": {},
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Contributions drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         return obs
 
-    def _check_eliminations(self) -> None:
-        if not self._should_transition_state():
-            return
+    def awaiting(self) -> List[str]:
+        """Players whose contribution for the current round is not in yet (everyone, at the start of a round)."""
+        contribs = self.internal_state.get("current_contributions", {})
+        return [a for a in self.agents if a not in contribs]
 
-        if self.current_state == "Contribute":
-            contribs = self.internal_state.setdefault("current_contributions", {})
-            # Default-and-continue: missing contributions default to 0 (free-ride)
-            # so the round always resolves and stale data can't carry over.
-            for agent in self.agents:
-                contribs.setdefault(agent, 0)
+    def take_reply(self, agent_name: str, contributed: int | None) -> None:
+        """Hold a clear contribution; ask an unclear (or failed) reply once more, then draw it at random.
+
+        A failure or an out-of-range amount never picks a fixed amount (0 would be the rank-dominant
+        move). Contributions stay hidden until the round is complete: the state is private.
+        """
+        if contributed is not None:
+            self.internal_state["current_contributions"][agent_name] = contributed
+            return
+        unclear = self.internal_state.setdefault("unclear", {})
+        unclear[agent_name] = unclear.get(agent_name, 0) + 1
+        round_num = self.internal_state.get("round", 0) + 1
+        tokens = self._config.get("tokens_per_round", 10)
+        if unclear[agent_name] == 1:
+            message = (
+                f"[Round {round_num}] {agent_name}'s reply did not give one whole number of tokens from 0 to {tokens}, "
+                f"so {agent_name} is asked again. Contributions stay hidden until the round is complete."
+            )
+        else:
+            self.internal_state["current_contributions"][agent_name] = (
+                self._fallback_rng.randint(0, tokens)
+            )
+            self.internal_state.setdefault("drawn", []).append(agent_name)
+            message = (
+                f"[Round {round_num}] {agent_name}'s second reply was also unclear, "
+                f"so {agent_name}'s contribution is drawn at random from 0 to {tokens}."
+            )
+        self.recv_message("Environment", SimpleMessage(message=message))
+
+    def _update_action_mask(self) -> None:
+        super()._update_action_mask()
+        if (
+            self.current_state == "Contribute"
+            and "current_contributions" in self.internal_state
+        ):
+            due = self.awaiting()
+            self.action_mask = [a in due for a in self.agents]
+
+    def _check_eliminations(self) -> None:
+        if self.current_state == "Contribute" and not self.awaiting():
+            contribs = self.internal_state["current_contributions"]
+            drawn = self.internal_state.get("drawn", [])
             scores = self.internal_state["scores"]
 
             tokens = self._config.get("tokens_per_round", 10)
             multiplier = self._config.get("multiplier", 1.5)
             num_players = len(self.agents)
 
-            total_pool = sum(contribs.values()) * multiplier
+            total_pool = sum(contribs.values()) * Fraction(str(multiplier))
             share = total_pool / num_players
 
             payoffs = {}
             for name in self.agents:
-                contrib = contribs.get(name, 0)
+                contrib = contribs[name]
                 payoff = (tokens - contrib) + share
-                payoffs[name] = round(payoff, 1)
-                scores[name] = round(scores.get(name, 0) + payoff, 1)
+                payoffs[name] = payoff
+                scores[name] = scores.get(name, Fraction(0)) + payoff
 
             round_num = self.internal_state["round"] + 1
             self.internal_state["round"] = round_num
-            self.internal_state["last_contributions"] = dict(contribs)
+            self.internal_state["last_contributions"] = {
+                n: contribs[n] for n in self.agents
+            }
             self.internal_state["current_contributions"] = {}
+            self.internal_state["unclear"] = {}
+            self.internal_state["drawn"] = []
+
+            def note(name: str) -> str:
+                return " (drawn at random)" if name in drawn else ""
 
             contrib_str = ", ".join(
-                f"{n}: contributed {contribs.get(n, 0)}" for n in self.agents
+                f"{n}: contributed {contribs[n]}{note(n)}" for n in self.agents
             )
-            payoff_str = ", ".join(f"{n}: earned {payoffs[n]}" for n in self.agents)
+            payoff_str = ", ".join(
+                f"{n}: earned {amount(payoffs[n])}" for n in self.agents
+            )
             self.recv_message(
                 "Environment",
                 SimpleMessage(
                     message=f"[Round {round_num}] Contributions: {contrib_str}. "
-                    f"Pool: {sum(contribs.values())} x {multiplier} = {total_pool:.1f}. "
-                    f"Share: {share:.1f} each. Payoffs: {payoff_str}. "
-                    f"Cumulative: {scores}"
+                    f"Pool: {sum(contribs.values())} x {multiplier} = {amount(total_pool)}. "
+                    f"Share: {amount(share)} each. Payoffs: {payoff_str}. "
+                    f"Cumulative: {amounts(scores)}"
                 ),
             )
 
             max_rounds = self._config.get("max_rounds", 10)
             if round_num >= max_rounds:
-                # Top n/2 earners win, bottom n/2 lose
-                sorted_players = sorted(
-                    scores.items(), key=lambda x: x[1], reverse=True
-                )
-                num_players = len(sorted_players)
-                top_n = num_players // 2
-                final = {}
-                for rank, (name, _) in enumerate(sorted_players):
-                    if rank < top_n:
-                        final[name] = 1.0
-                    else:
-                        final[name] = -1.0
-                # Handle ties at the boundary
-                boundary_score = sorted_players[top_n - 1][1] if top_n > 0 else 0
-                if all(s == boundary_score for _, s in sorted_players):
-                    final = {n: 0.0 for n in scores}
+                # Top n/2 earners win, bottom n/2 lose; equal earners share a fate.
+                final = rank_split_rewards(scores)
 
-                reason = (
-                    f"Game over after {max_rounds} rounds. Final earnings: {scores}"
-                )
+                reason = f"Game over after {max_rounds} rounds. Final earnings: {amounts(scores)}"
                 self.internal_state["game_over"] = True
                 self.internal_state["final_scores"] = final
                 self.internal_state["end_reason"] = reason
@@ -242,7 +371,10 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[PublicGoodsEvaluator(max_turn_number=10)],
+        # Safety cap only: every round takes one step, or two when a player is asked again.
+        evaluators=[
+            PublicGoodsEvaluator(max_turn_number=2 * config.get("max_rounds", 10))
+        ],
         terminal_evaluators=[],
         hide_unknown=True,
     )

@@ -25,6 +25,15 @@ Per round (example):
 Win conditions:
 - Top 2 earners: +1.0 reward
 - Bottom 2 earners: -1.0 reward
+- Players tied on earnings share one result: a tied group inside the top half wins, inside the bottom half loses, and one straddling the boundary draws (0.0). All tied: draw for everyone. Seating order never decides. The description, the goal and every turn's instruction state this rule, with two worked examples (30, 30, 30, 12: three draws and a loss; 30, 20, 20, 12: a win, two draws and a loss).
+
+Earnings are kept exactly (shares are eighths of a token); messages round them to 3 decimals only for display, so equal true earnings always tie.
+
+## Reading a contribution
+The contribution is the number after `contribute` ("In round 3 I contribute 7" is 7); a reply without `contribute` must hold exactly one number. A negated amount ("I won't contribute 5") does not count. Two different amounts, no amount, a fraction of a token, or an amount below 0 or above 10 is unclear; out-of-range amounts are asked again, not clamped.
+
+## Unclear replies
+A reply that does not give one whole number of tokens (including a failed model call) is not read as a contribution. The engine says so to everyone and asks that player once more; every other contribution stays hidden, because replies are private. If the second reply is also unclear, the contribution is drawn at random from 0 to 10, each amount equally likely, from a stream seeded by the roster; a failure never picks a fixed amount such as 0, the rank-dominant move. The round results mark a drawn contribution. The match still lasts 10 rounds; a round with a repeated reply takes one extra step.
 
 ## Social Skills Tested
 - **Free-riding:** Benefiting from others' contributions while contributing little yourself.

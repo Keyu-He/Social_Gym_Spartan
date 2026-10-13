@@ -22,7 +22,11 @@ Per round:
 - Loss: 0 points
 - Tie: 0 points
 
-Final rewards: Winner gets +1.0, loser gets -1.0, tie gives 0.0 each.
+Final rewards: Winner gets +1.0, loser gets -1.0, tie gives 0.0 each; the rules text says equal points are a draw. The engine stores the round points as stated (1 for the round winner, 0 for the loser), and "[Game] Entering state: Round" is posted only when a new round starts.
+
+## Unclear replies
+A reply that does not name exactly one throw (including a failed model call) is not read as a move. A throw right after a negation in its clause ("not rock", "I won't play scissors") does not name that throw, so "not rock, paper" is paper. The engine says so to both players and asks that player once more; the other player's throw stays hidden, because replies in this state are private and the round results report only the parsed moves. If the second reply is also unclear, the move is drawn at random, each throw equally likely, from a stream seeded by the roster. The round results mark a drawn move. The match still lasts 10 rounds; a round with a repeated reply takes one extra step.
+Singular and plural name the same throw (`rocks`, `papers`, `scissor`).
 
 ## Social Skills Tested
 - **Pattern recognition:** Detecting and exploiting opponent tendencies over repeated play.

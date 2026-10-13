@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import os
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -50,8 +52,11 @@ class ResistanceEvaluator(SocialGameEndEvaluator):
     def __call__(
         self, turn_number: int, messages: List[Tuple[str, Message]], **kwargs: Any
     ) -> List[Tuple[str, Tuple[Tuple[str, int | float | bool], str]]]:
-        if turn_number >= self.max_turn_number:
-            env = kwargs.get("env")
+        env = kwargs.get("env")
+        # A game decided on the capped turn keeps its result (it used to be logged as a 0-0 timeout).
+        if turn_number >= self.max_turn_number and not (
+            env and env.internal_state.get("game_over", False)
+        ):
             if env:
                 response: List[
                     Tuple[str, Tuple[Tuple[str, int | float | bool], str]]
@@ -63,7 +68,6 @@ class ResistanceEvaluator(SocialGameEndEvaluator):
                 return response
             return [("environment", (("terminated", True), "Max turns reached."))]
 
-        env = kwargs.get("env")
         if not env:
             return [("environment", (("terminated", False), ""))]
 
@@ -82,6 +86,110 @@ class ResistanceEvaluator(SocialGameEndEvaluator):
 
 
 # ============================================================================
+# Reading replies
+# ============================================================================
+
+_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})
+# A word before a keyword that turns it around: "I do not approve", "I won't play fail", "never fail".
+_NEGATION = r"(?:\bnot|\bnever|n't|\bcannot|\bno\s+way\s+(?:i|we)(?:'ll|\s+will)?)(?:\s+\w+){0,2}\s+$"
+
+
+def _first_keyword(text: str, groups: Dict[str, str]) -> str | None:
+    """The group of the first keyword in the text, a negated keyword counting for the other group (two groups)."""
+    low = (text or "").translate(_QUOTES).lower()
+    hits = []
+    for group, pattern in groups.items():
+        for m in re.finditer(rf"\b(?:{pattern})\b", low):
+            negated = bool(re.search(_NEGATION, low[: m.start()]))
+            hits.append((m.start(), group, negated))
+    if not hits:
+        return None
+    _, group, negated = min(hits)
+    if negated:
+        return next(g for g in groups if g != group)
+    return group
+
+
+def read_team_vote(text: str) -> str | None:
+    """'approve', 'reject', or None when the reply is neither.
+
+    The first approve/reject word decides, a negated one counting the other way ("I do not approve" rejects);
+    "yes" or "no" as whole words count only when neither word is there. Votes used to be read by substring,
+    approve first, so "I reject ... shouldn't be so quick to approve" approved and "another chance" rejected.
+    """
+    vote = _first_keyword(
+        text,
+        {
+            "approve": r"approve[sd]?|approving|approval|accept(?:s|ed|ing)?",
+            "reject": r"reject(?:s|ed|ing)?|rejection|disapprove[sd]?|veto",
+        },
+    )
+    return vote or _first_keyword(
+        text, {"approve": r"yes|yeah|aye", "reject": r"no|nope|nay"}
+    )
+
+
+def read_mission_card(text: str) -> str | None:
+    """'succeed', 'fail', or None when the reply is neither.
+
+    The first card word decides, a negated one counting the other way ("I will not fail" succeeds). Any spy text
+    containing "fail" used to be a Fail, so "I will not fail this mission, I play succeed" failed the mission.
+    """
+    return _first_keyword(
+        text,
+        {
+            "succeed": r"succeed(?:s|ed|ing)?|success(?:ful)?",
+            "fail": r"fail(?:s|ed|ing|ure)?|sabotage[sd]?",
+        },
+    )
+
+
+def read_proposal(text: str, names: List[str]) -> List[str]:
+    """The players a proposal names, in the order given.
+
+    Names match as whole words in any case, so "propose Alice, Bob." names both (a name with a comma or full stop
+    attached used to be missed, and the team was then padded in seat order). After the word "propose" the team runs
+    to the end of that sentence ("propose Alice and Bob because Carol ..." names Alice and Bob); a reply without
+    "propose", or with no name after it, counts every player it names.
+    """
+    text = (text or "").translate(_QUOTES)
+
+    def named(segment: str) -> List[str]:
+        found = []
+        for n in names:
+            m = re.search(
+                r"(?<![A-Za-z])"
+                + r"\s+".join(map(re.escape, n.split()))
+                + r"(?![A-Za-z])",
+                segment,
+                re.I,
+            )
+            if m:
+                found.append((m.start(), n))
+        return [n for _, n in sorted(found)]
+
+    m = re.search(r"\bpropos(?:e|es|ing|al)\b", text, re.IGNORECASE)
+    if m:
+        segment = re.split(
+            r"[;!?\n]|\.(?:\s|$)|\b(?:because|since|as|while)\b",
+            text[m.end() :],
+            maxsplit=1,
+        )[0]
+        team = named(segment)
+        if team:
+            return team
+    return named(text)
+
+
+def _acting(env: SocialDeductionGame, agent_name: str) -> bool:
+    """Whether the engine asked this player to act in the step being processed."""
+    try:
+        return bool(env.action_mask[env.agents.index(agent_name)])
+    except (ValueError, IndexError):
+        return False
+
+
+# ============================================================================
 # Action Handler
 # ============================================================================
 
@@ -92,10 +200,13 @@ class ResistanceActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
-        if not isinstance(env, ResistanceEnv):
+        if not isinstance(env, ResistanceEnv) or not _acting(env, agent_name):
             return
-        if action.action_type not in ["action", "speak"]:
-            return
+        # A failed model call arrives as 'none'; it is read as an empty reply, and every phase says what that
+        # means (it used to be dropped: the old team stayed, or the mission never resolved).
+        text = (
+            action.argument.strip() if action.action_type in ["action", "speak"] else ""
+        )
 
         if env.current_state == "Mission_proposal":
             # Only the leader proposes
@@ -106,15 +217,7 @@ class ResistanceActionHandler(ActionHandler):
             if agent_name != leader_name:
                 return
 
-            # Parse "propose NAME1 NAME2 ..."
-            arg = action.argument.strip()
-            proposed = []
-            words = arg.split()
-            for w in words:
-                for name in env.agents:
-                    if w.lower() == name.lower() and name not in proposed:
-                        proposed.append(name)
-                        break
+            proposed = read_proposal(text, agent_list)
 
             mission_num = env.internal_state.get("current_mission", 0)
             mission_sizes = env._config.get("mission_sizes", [2, 3, 2, 3, 3])
@@ -123,26 +226,49 @@ class ResistanceActionHandler(ActionHandler):
             )
 
             if len(proposed) != required_size:
-                # Default-and-continue: trim or pad to the required size so the
-                # round advances. Padding picks alive players in roster order
-                # who aren't already on the team.
+                if not text:
+                    issue = "was missing"
+                elif not proposed:
+                    issue = "named no player"
+                else:
+                    issue = f"named {len(proposed)} ({', '.join(proposed)})"
+                if not env.internal_state.get("proposal_retry"):
+                    # First wrong-size proposal: announced, and the same leader proposes once more (the state
+                    # stays Mission_proposal for one more turn; see ResistanceEnv._should_transition_state).
+                    env.internal_state["proposal_retry"] = True
+                    env.recv_message(
+                        "Environment",
+                        SimpleMessage(
+                            message=f"[Game] {agent_name}'s proposal {issue}, but Mission {mission_num + 1} needs "
+                            f"exactly {required_size} players. {agent_name} proposes once more; if that proposal "
+                            f"is also the wrong size, the engine trims it or fills it up in seat order."
+                        ),
+                    )
+                    return
+                # Second wrong-size proposal: trimmed to the first players named, or filled up with players in
+                # seat order who are not on it yet; announced, and the team goes to the vote. Not a rejection.
                 if len(proposed) > required_size:
                     proposed = proposed[:required_size]
+                    how = f"trimmed to the first {required_size} named"
                 else:
                     for n in env.agents:
                         if len(proposed) >= required_size:
                             break
                         if n not in proposed and env.agent_alive.get(n, True):
                             proposed.append(n)
+                    how = f"filled up in seat order to {required_size}"
                 env.recv_message(
                     "Environment",
                     SimpleMessage(
-                        message=f"[Game] {agent_name} proposed an invalid team size; "
-                        f"defaulted to: {', '.join(proposed)}."
+                        message=f"[Game] {agent_name}'s second proposal {issue} too, so the team is {how}: "
+                        f"{', '.join(proposed)}."
                     ),
                 )
+            env.internal_state["proposal_retry"] = False
 
+            # A new proposal is a new team: nothing from an earlier team carries over.
             env.internal_state["mission_team"] = proposed
+            env.internal_state["mission_actions"] = {}
             env.recv_message(
                 "Environment",
                 SimpleMessage(
@@ -152,14 +278,17 @@ class ResistanceActionHandler(ActionHandler):
             )
 
         elif env.current_state == "Mission_vote":
-            arg = action.argument.strip().lower()
             if "votes" not in env.internal_state:
                 env.internal_state["votes"] = {}
-
-            if "approve" in arg or "yes" in arg:
-                env.internal_state["votes"][agent_name] = "approve"
-            elif "reject" in arg or "no" in arg:
-                env.internal_state["votes"][agent_name] = "reject"
+            vote = read_team_vote(text)
+            if vote is None:
+                # Every player votes; a reply that is neither approve nor reject counts as a reject (a tie
+                # rejects anyway), so approval always needs a majority of the table. Announced at the tally.
+                vote = "reject"
+                env.internal_state.setdefault("vote_problems", {})[agent_name] = (
+                    "could not be read as approve or reject" if text else "was missing"
+                )
+            env.internal_state["votes"][agent_name] = vote
 
         elif env.current_state == "Mission_execute":
             # Only team members can act
@@ -167,16 +296,36 @@ class ResistanceActionHandler(ActionHandler):
             if agent_name not in team:
                 return
 
-            arg = action.argument.strip().lower()
             if "mission_actions" not in env.internal_state:
                 env.internal_state["mission_actions"] = {}
 
             role = env.agent_to_role.get(agent_name, "")
-            if "fail" in arg and role == "Spy":
-                env.internal_state["mission_actions"][agent_name] = "fail"
+            card = read_mission_card(text)
+            if role != "Spy":
+                # Resistance MUST succeed
+                played = "succeed"
+                note = (
+                    ""
+                    if card == "succeed"
+                    else " Resistance members always play succeed."
+                )
+            elif card:
+                played, note = card, ""
             else:
-                # Resistance MUST succeed; Spies default to succeed if ambiguous
-                env.internal_state["mission_actions"][agent_name] = "succeed"
+                # A Spy's reply that is neither card (or no reply) is a succeed
+                played = "succeed"
+                note = (
+                    " Your reply was neither 'succeed' nor 'fail', so it counts as succeed."
+                    if text
+                    else (" You sent no card, so it counts as succeed.")
+                )
+            env.internal_state["mission_actions"][agent_name] = played
+            # Cards are secret: the player alone is told how its card was read.
+            env.recv_message(
+                "Environment",
+                SimpleMessage(message=f"[Private] Your mission card: {played}.{note}"),
+                receivers=[agent_name],
+            )
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, ResistanceEnv):
@@ -206,8 +355,19 @@ class ResistanceActionHandler(ActionHandler):
         elif env.current_state == "Mission_proposal":
             if agent_name == leader_name:
                 player_list = ", ".join(agent_list)
+                if env.internal_state.get("proposal_retry"):
+                    again = (
+                        f"Your proposal had the wrong size. Propose exactly {required_size} players for Mission "
+                        f"{mission_num + 1}. If this proposal is also the wrong size, the engine trims it to the "
+                        f"first {required_size} named or fills it up in seat order."
+                    )
+                else:
+                    again = (
+                        f"Propose {required_size} players for Mission {mission_num + 1}. A proposal of the wrong "
+                        f"size is announced and you propose once more."
+                    )
                 return (
-                    f"You are the Leader. Propose {required_size} players for Mission {mission_num + 1}. "
+                    f"You are the Leader. {again} "
                     f"{status} Players: [{player_list}]. "
                     f"Use 'propose NAME1 NAME2 ...' (e.g., 'propose Alice Bob')."
                 )
@@ -217,7 +377,7 @@ class ResistanceActionHandler(ActionHandler):
             team = env.internal_state.get("mission_team", [])
             return (
                 f"Vote on the proposed team: [{', '.join(team)}]. {status} "
-                f"Use 'approve' or 'reject'."
+                f"Use 'approve' or 'reject'. A reply that is neither counts as a reject."
             )
         elif env.current_state == "Mission_execute":
             team = env.internal_state.get("mission_team", [])
@@ -226,7 +386,7 @@ class ResistanceActionHandler(ActionHandler):
                 if role == "Spy":
                     return (
                         f"You are on the mission team. As a Spy, choose 'succeed' or 'fail'. "
-                        f"{status}"
+                        f"A reply that is neither counts as succeed. {status}"
                     )
                 else:
                     return f"You are on the mission team. As Resistance, you must play 'succeed'. {status}"
@@ -247,6 +407,11 @@ class ResistanceEnv(SocialDeductionGame):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(action_handler=ResistanceActionHandler(), **kwargs)
+
+    @property
+    def game_variant(self) -> str:
+        """The rule variant this game plays: '' for the published game, else the name apply_variant gave it."""
+        return str(self._config.get("variant", ""))
 
     def reset(
         self,
@@ -271,8 +436,10 @@ class ResistanceEnv(SocialDeductionGame):
             "successes": 0,
             "failures": 0,
             "consecutive_rejections": 0,
+            "proposal_retry": False,
             "mission_team": [],
             "votes": {},
+            "vote_problems": {},
             "mission_actions": {},
             "game_over": False,
             "final_scores": {},
@@ -303,6 +470,14 @@ class ResistanceEnv(SocialDeductionGame):
 
         return obs
 
+    def _should_transition_state(self) -> bool:
+        # After a first wrong-size proposal the leader proposes once more before the vote.
+        if self.current_state == "Mission_proposal" and self.internal_state.get(
+            "proposal_retry"
+        ):
+            return False
+        return super()._should_transition_state()
+
     def _check_eliminations(self) -> None:
         """Handle mission resolution and state transitions."""
         if not self._should_transition_state():
@@ -310,76 +485,99 @@ class ResistanceEnv(SocialDeductionGame):
 
         if self.current_state == "Mission_vote":
             votes = self.internal_state.get("votes", {})
-            if votes:
-                approve_count = sum(1 for v in votes.values() if v == "approve")
-                reject_count = sum(1 for v in votes.values() if v == "reject")
-
-                # Announce vote results
+            # Each vote that could not be read (or was missing) counts as a reject, and says so; a round in which
+            # no vote was readable is a rejection like any other (it used to send the team out unapproved).
+            for name, problem in self.internal_state.get("vote_problems", {}).items():
                 self.recv_message(
                     "Environment",
                     SimpleMessage(
-                        message=f"[Game] Vote results: {approve_count} approve, {reject_count} reject. "
-                        f"(Votes: {dict(votes)})"
+                        message=f"[Game] {name}'s vote {problem}; it counts as a reject."
+                    ),
+                )
+            self.internal_state["vote_problems"] = {}
+            approve_count = sum(1 for v in votes.values() if v == "approve")
+            reject_count = sum(1 for v in votes.values() if v == "reject")
+
+            # Announce vote results
+            self.recv_message(
+                "Environment",
+                SimpleMessage(
+                    message=f"[Game] Vote results: {approve_count} approve, {reject_count} reject. "
+                    f"(Votes: {dict(votes)})"
+                ),
+            )
+
+            if approve_count > reject_count:
+                # Mission approved
+                self.internal_state["consecutive_rejections"] = 0
+                self.recv_message(
+                    "Environment",
+                    SimpleMessage(
+                        message="[Game] Mission team APPROVED! Proceeding to mission execution."
+                    ),
+                )
+            else:
+                # Mission rejected: the team is gone, and nothing of it carries over to the next proposal
+                self.internal_state["mission_team"] = []
+                self.internal_state["mission_actions"] = {}
+                self.internal_state["consecutive_rejections"] = (
+                    self.internal_state.get("consecutive_rejections", 0) + 1
+                )
+                rejections = self.internal_state["consecutive_rejections"]
+                self.recv_message(
+                    "Environment",
+                    SimpleMessage(
+                        message=f"[Game] Mission team REJECTED! "
+                        f"({rejections}/5 consecutive rejections)"
                     ),
                 )
 
-                if approve_count > reject_count:
-                    # Mission approved
-                    self.internal_state["consecutive_rejections"] = 0
+                # Check if 5 rejections = Spies win
+                if rejections >= 5:
+                    self.internal_state["votes"] = {}
+                    self._end_game(
+                        "Spies", "5 consecutive proposals rejected! Spies win!"
+                    )
+                    return
+
+                # Rotate leader and go back to Discussion
+                self.internal_state["leader_idx"] = (
+                    self.internal_state.get("leader_idx", 0) + 1
+                )
+                agent_list = list(self.agents)
+                new_leader = agent_list[
+                    self.internal_state["leader_idx"] % len(agent_list)
+                ]
+                self.recv_message(
+                    "Environment",
+                    SimpleMessage(message=f"[Game] New leader: {new_leader}."),
+                )
+
+                # Override state back to Discussion (to the next proposal in the no-discussion variant, announced
+                # as the proposal after a mission is)
+                round_start = (
+                    "Mission_proposal"
+                    if self.game_variant == NO_DISCUSSION
+                    else "Discussion"
+                )
+                self.current_state = round_start
+                if hasattr(self, "_state_turn_count"):
+                    self._state_turn_count[round_start] = 0
+                if hasattr(self, "_round_robin_idx"):
+                    self._round_robin_idx = 0
+                if round_start != "Discussion":
                     self.recv_message(
                         "Environment",
-                        SimpleMessage(
-                            message="[Game] Mission team APPROVED! Proceeding to mission execution."
-                        ),
-                    )
-                else:
-                    # Mission rejected
-                    self.internal_state["consecutive_rejections"] = (
-                        self.internal_state.get("consecutive_rejections", 0) + 1
-                    )
-                    rejections = self.internal_state["consecutive_rejections"]
-                    self.recv_message(
-                        "Environment",
-                        SimpleMessage(
-                            message=f"[Game] Mission team REJECTED! "
-                            f"({rejections}/5 consecutive rejections)"
-                        ),
+                        SimpleMessage(message=f"[Game] Entering state: {round_start}"),
                     )
 
-                    # Check if 5 rejections = Spies win
-                    if rejections >= 5:
-                        self._end_game(
-                            "Spies", "5 consecutive proposals rejected! Spies win!"
-                        )
-                        return
-
-                    # Rotate leader and go back to Discussion
-                    self.internal_state["leader_idx"] = (
-                        self.internal_state.get("leader_idx", 0) + 1
-                    )
-                    agent_list = list(self.agents)
-                    new_leader = agent_list[
-                        self.internal_state["leader_idx"] % len(agent_list)
-                    ]
-                    self.recv_message(
-                        "Environment",
-                        SimpleMessage(message=f"[Game] New leader: {new_leader}."),
-                    )
-
-                    # Override state back to Discussion
-                    self.current_state = "Discussion"
-                    if hasattr(self, "_state_turn_count"):
-                        self._state_turn_count["Discussion"] = 0
-                    if hasattr(self, "_round_robin_idx"):
-                        self._round_robin_idx = 0
-
-                self.internal_state["votes"] = {}
+            self.internal_state["votes"] = {}
 
         elif self.current_state == "Mission_execute":
             actions = self.internal_state.get("mission_actions", {})
             team = self.internal_state.get("mission_team", [])
 
-            if len(actions) >= len(team):
+            if team and len(actions) >= len(team):
                 fail_count = sum(1 for v in actions.values() if v == "fail")
                 mission_num = self.internal_state.get("current_mission", 0)
 
@@ -505,6 +703,77 @@ class ResistanceEnv(SocialDeductionGame):
 
 
 # ============================================================================
+# No-discussion variant (communication control, results/sec4_comm_control/README.md)
+# ============================================================================
+
+# SOTOPIA_GAME_VARIANT=no_discussion, read when the environment is created, removes Discussion: the game opens with
+# the first leader's proposal, and every mission or rejected team is followed by the next proposal. Roles,
+# proposals, votes, missions, win rules, the turn cap and the engine's announcements stay as they are. The rules
+# text loses its discussion sentence and says in one sentence that there is no discussion phase. Unset or empty,
+# the game is the published one.
+GAME_VARIANT_ENV = "SOTOPIA_GAME_VARIANT"
+NO_DISCUSSION = "no_discussion"
+# (published rules text, no-discussion rules text); each published text occurs once in config.json's description.
+NO_DISCUSSION_RULES = [
+    (
+        "No player is ever eliminated.\n\nGAME FLOW:\n1. Discussion: All players discuss strategy publicly.\n"
+        "2. Mission_proposal:",
+        "No player is ever eliminated. There is no discussion phase: each new leader proposes a team right away."
+        "\n\nGAME FLOW:\n1. Mission_proposal:",
+    ),
+    ("\n3. Mission_vote:", "\n2. Mission_vote:"),
+    (
+        "leader rotates, back to Discussion.",
+        "leader rotates, back to Mission_proposal.",
+    ),
+    ("\n4. Mission_execute:", "\n3. Mission_execute:"),
+]
+
+
+def game_variant() -> str:
+    """The variant SOTOPIA_GAME_VARIANT names: '' (the published game) or 'no_discussion'."""
+    variant = os.environ.get(GAME_VARIANT_ENV, "").strip()
+    if variant not in ("", NO_DISCUSSION):
+        raise ValueError(
+            f"{GAME_VARIANT_ENV}={variant!r}: The Resistance has no such variant (only {NO_DISCUSSION!r})"
+        )
+    return variant
+
+
+def apply_variant(config: Dict[str, Any]) -> Dict[str, Any]:
+    """`config` itself when no variant is set (or `config` is already the variant's). Otherwise a copy without
+    Discussion (the game opens with Mission_proposal, and Mission_execute leads to it), with the no-discussion rules
+    text, marked config["variant"]."""
+    variant = game_variant()
+    if not variant or config.get("variant") == variant:
+        return config
+    config = copy.deepcopy(config)
+    text = config["description"]
+    for published, replacement in NO_DISCUSSION_RULES:
+        if text.count(published) != 1:
+            raise ValueError(
+                f"{variant}: the Resistance rules text no longer has {published!r} exactly once"
+            )
+        text = text.replace(published, replacement)
+    config["description"] = text
+    _skip_state(config, "Discussion")
+    config["variant"] = variant
+    return config
+
+
+def _skip_state(config: Dict[str, Any], state: str) -> None:
+    """Take `state` out of the state machine: the state before it leads to the state after it."""
+    transitions = config["state_transition"]
+    after = transitions.pop(state)
+    for before, nxt in transitions.items():
+        if nxt == state:
+            transitions[before] = after
+    if config.get("initial_state") == state:
+        config["initial_state"] = after
+    config["state_properties"].pop(state)
+
+
+# ============================================================================
 # Setup helpers
 # ============================================================================
 
@@ -528,14 +797,40 @@ def ensure_agent_profile(config: Dict[str, Any]) -> AgentProfile:
     return profile
 
 
+def longest_game(mission_sizes: List[int], players: int = 5) -> int:
+    """The most turns a game can take. A proposal costs one turn per player for Discussion, two proposal turns (a
+    wrong-size first proposal is asked once more) and one vote; the fifth rejected proposal in a row ends the game,
+    so a mission takes at most four rejected proposals plus an approved one and its one execution turn. The longest
+    game plays every mission (the score is 2-2 before the last)."""
+    proposal = players + 2 + 1
+    return len(mission_sizes) * (5 * proposal + 1)
+
+
+# A backstop only, never told to the models: every game ends by turn 205 (5 missions x (5 proposals x 8 turns + 1)),
+# 180 when no proposal is asked again, so this cap never cuts a game. It used to be 100, which cut games of 14 or
+# more proposals. The no-discussion variant keeps it (its longest game is 80 turns).
+MAX_TURNS = longest_game([2, 3, 2, 3, 3])
+
+
 def create_environment(
     env_profile: EnvironmentProfile, model_name: str, config: Dict[str, Any]
 ) -> ResistanceEnv:
+    config = apply_variant(config)
     return ResistanceEnv(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[ResistanceEvaluator(max_turn_number=100)],
+        evaluators=[
+            ResistanceEvaluator(
+                max_turn_number=max(
+                    MAX_TURNS,
+                    longest_game(
+                        config.get("mission_sizes", [2, 3, 2, 3, 3]),
+                        len(config.get("agents", [])) or 5,
+                    ),
+                )
+            )
+        ],
         terminal_evaluators=[],
         hide_unknown=True,
     )
@@ -622,6 +917,7 @@ def prepare_scenario(
 ) -> tuple[SocialDeductionGame, List[LLMAgent]]:
     if config is None:
         config = load_config(CONFIG_PATH)
+    config = apply_variant(config)
     agent_profiles = [ensure_agent_profile(entry) for entry in config.get("agents", [])]
     agent_goals = [
         config.get("role_goals", {}).get(entry.get("role", ""), "")
@@ -682,6 +978,7 @@ async def main() -> None:
     print_roster(config)
     print("=" * 60)
 
+    variant = getattr(env, "game_variant", "")
     await arun_one_episode(
         env=env,
         agent_list=agents,
@@ -690,6 +987,7 @@ async def main() -> None:
         json_in_script=False,
         tag="test_resistance",
         push_to_db=True,
+        metadata={"variant": variant} if variant else None,
     )
 
 

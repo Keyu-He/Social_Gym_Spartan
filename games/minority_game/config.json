@@ -1,8 +1,8 @@
 {
     "scenario": "Minority Game",
-    "description": "5 players play the Minority Game for exactly 12 rounds. You cannot speak to the other players. Each round, simultaneously choose 'go' or 'stay'. If fewer than half go, goers score 3 (minority wins). If half or more go, stayers score 3 (minority wins). You want to be in the minority! GOAL: Maximize your own score over the 12 rounds. The player with the highest score wins. Players: {agent_names}.",
+    "description": "5 players play the Minority Game for exactly 12 rounds. You cannot speak to the other players. Each round, simultaneously choose 'go' or 'stay'. If fewer than half go, goers score 3 (minority wins). If half or more go, stayers score 3 (minority wins). You want to be in the minority! GOAL: Maximize your own score over the 12 rounds. After round 12 the 2 highest scorers win, the 2 lowest lose and the middle player draws. Players with equal totals share one result: a tied group that lies entirely within the top 2 places wins, one that lies entirely within the bottom 2 places loses, and any other tied group (one that holds 3rd place or straddles the line between winners and losers) draws. For example, with totals 30, 30, 30, 12, 12, the three players on 30 draw and the two players on 12 lose; with totals 30, 20, 20, 12, 12, the player on 30 wins, the two players on 20 draw and the two players on 12 lose. Unclear replies: a reply that does not name exactly one of 'go' or 'stay' (a move word right after a negation, as in \"don't go\", does not name that move), or that fails, is announced to everyone and that player is asked once more, while the other moves stay hidden; if the second reply is also unclear, that player's move is drawn at random, each move equally likely. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own score over 12 rounds by being in the minority group. Top half of players by score win."
+        "Player": "Maximize your own score over 12 rounds by being in the minority group. The 2 highest scorers win, the 2 lowest lose and the middle player draws. Players with equal totals share one result; a tied group that straddles the line between winners and losers draws."
     },
     "role_secrets": {},
     "max_rounds": 12,
@@ -11,6 +11,6 @@
         "Choose": "Choose"
     },
     "state_properties": {
-        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Choose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

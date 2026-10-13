@@ -1,44 +1,101 @@
 {
     "scenario": "The Chameleon",
-    "description": "This game is called The Chameleon. There are 5 players: 1 Chameleon and 4 Citizens. A secret word is chosen from a category. All Citizens know both the category and the secret word. The Chameleon knows only the category and a list of possible words.\n\nGAME STRUCTURE: The game has four possible phases: Clue, Discussion, Vote, and Guess.\n- During Clue, each player gives a ONE-WORD clue related to the secret word. Citizens want to prove they know the word without making it too obvious (or the Chameleon figures it out). The Chameleon must give a plausible clue despite not knowing the exact word.\n- During Discussion, players discuss who they think the Chameleon is, based on whose clue seemed vague or off.\n- During Vote, all players simultaneously vote on who they think the Chameleon is.\n- Resolution: If the Chameleon is correctly identified by plurality vote, the Chameleon gets one last chance to guess the secret word. If the Chameleon guesses correctly, the Chameleon wins. If the Chameleon guesses wrong, the Citizens win. If the wrong player is voted out, the Chameleon wins immediately.\n\nCOMMANDS:\n- Clue phase: say your ONE-WORD clue (e.g., 'yellow').\n- Discussion phase: use 'speak' to discuss suspicions.\n- Vote phase: use 'vote NAME' to vote for who you think is the Chameleon.\n- Guess phase (Chameleon only, if caught): use 'guess WORD' to guess the secret word.\n\nPlayers: {agent_names}.",
+    "description": "This game is called The Chameleon. There are 5 players: 1 Chameleon and 4 Citizens. Everyone sees the same topic card: a category and 16 possible words. One word on the card is the secret word. All Citizens know which word it is; the Chameleon does not. The first player in clue order is the dealer.\n\nGAME STRUCTURE:\n- During Clue, starting with the dealer and following player order, each player gives a ONE-WORD clue related to the secret word. Repeating another player's clue is allowed. Citizens want to prove they know the word without making it too obvious (or the Chameleon figures it out). The Chameleon must give a plausible clue despite not knowing the exact word.\n- During Discussion, players discuss who they think the Chameleon is, based on whose clue seemed vague or off.\n- During Vote, all players simultaneously vote on who they think the Chameleon is. The player with the most votes is accused. If the highest vote count is tied, a TieBreak phase lets the dealer choose one of the tied players; if the dealer's reply names none of them, one of the tied players is drawn at random.\n- Resolution: If the Chameleon is correctly identified, the Chameleon gets one last chance to guess the secret word. If the Chameleon guesses correctly, the Chameleon wins. If the Chameleon guesses wrong, the Citizens win. If the wrong player is accused, the Chameleon wins immediately.\n\nCOMMANDS:\n- Clue phase: say your ONE-WORD clue (e.g., 'yellow').\n- Discussion phase: use 'speak' to discuss suspicions.\n- Vote phase: use 'vote NAME' to vote for who you think is the Chameleon. A vote that names no single player counts as no vote.\n- TieBreak phase (dealer only, if tied): use 'vote NAME' to choose one of the tied players.\n- Guess phase (Chameleon only, if caught): use 'guess WORD' to name the secret word as written on the topic card. A reply that names no single word from the card counts as a wrong guess.\n\nPlayers: {agent_names}.",
     "role_goals": {
         "Citizen": "Figure out who the Chameleon is by giving a clue that proves you know the secret word, without making the word too obvious. Then vote to identify the Chameleon.",
         "Chameleon": "Blend in with the Citizens by giving a plausible one-word clue. Avoid being identified. If caught, try to guess the secret word from the clues others gave."
     },
     "role_secrets": {
-        "Citizen": "The category is: {category}. The secret word is: {secret_word}.",
+        "Citizen": "The category is: {category}. The possible words are: {word_list}. The secret word is: {secret_word}.",
         "Chameleon": "You are the Chameleon. The category is: {category}. You do NOT know the secret word. The possible words are: {word_list}. You must blend in by giving a plausible clue."
     },
     "category_pool": [
-        {"category": "animal", "word_list": ["kangaroo", "elephant", "octopus", "penguin", "butterfly", "dolphin", "giraffe", "hedgehog", "chameleon", "rhinoceros", "flamingo", "cheetah"]},
-        {"category": "food", "word_list": ["pizza", "sushi", "chocolate", "banana", "hamburger", "pancake", "popcorn", "spaghetti", "croissant", "watermelon", "hummus", "taco"]},
-        {"category": "vehicle", "word_list": ["bicycle", "airplane", "submarine", "motorcycle", "helicopter", "train", "scooter", "sailboat", "skateboard", "hot-air balloon"]},
-        {"category": "object", "word_list": ["telescope", "umbrella", "calculator", "microscope", "refrigerator", "vacuum cleaner", "lawn mower", "sewing machine", "hammock", "paintbrush", "magnifying glass"]},
-        {"category": "place", "word_list": ["library", "beach", "mountain", "museum", "lighthouse", "aquarium", "observatory", "planetarium", "castle", "cathedral", "bridge", "marketplace"]},
-        {"category": "activity", "word_list": ["swimming", "painting", "cooking", "skiing", "dancing", "gardening", "fishing", "knitting", "photography", "sculpting", "juggling", "archery"]},
-        {"category": "natural phenomenon", "word_list": ["rainbow", "volcano", "glacier", "waterfall", "earthquake", "tornado", "aurora", "geyser", "lightning", "eclipse"]},
-        {"category": "musical instrument", "word_list": ["guitar", "violin", "drum", "trumpet", "piano", "accordion", "harmonica", "saxophone"]},
-        {"category": "sport", "word_list": ["soccer", "basketball", "baseball", "hockey", "tennis", "cricket", "golf", "volleyball", "badminton", "gymnastics"]},
-        {"category": "profession", "word_list": ["doctor", "teacher", "chef", "firefighter", "astronaut", "librarian", "carpenter", "plumber", "journalist", "magician"]}
+        {"category": "breakfast food", "word_list": ["pancake", "waffle", "omelette", "bacon", "toast", "cereal", "oatmeal", "bagel", "croissant", "muffin", "yogurt", "granola", "sausage", "hashbrown", "doughnut", "scone"]},
+        {"category": "string instrument", "word_list": ["violin", "guitar", "cello", "harp", "banjo", "ukulele", "mandolin", "viola", "sitar", "lute", "fiddle", "zither", "lyre", "harpsichord", "dulcimer", "bouzouki"]},
+        {"category": "root vegetable", "word_list": ["carrot", "potato", "beet", "radish", "turnip", "parsnip", "ginger", "onion", "garlic", "celeriac", "rutabaga", "yam", "horseradish", "daikon", "shallot", "leek"]},
+        {"category": "farm animal", "word_list": ["cow", "pig", "sheep", "goat", "chicken", "horse", "duck", "goose", "turkey", "donkey", "rabbit", "llama", "alpaca", "rooster", "hen", "lamb"]},
+        {"category": "kitchen utensil", "word_list": ["spatula", "whisk", "ladle", "tongs", "peeler", "grater", "colander", "sieve", "cleaver", "corkscrew", "masher", "skimmer", "chopsticks", "funnel", "mandoline", "zester"]},
+        {"category": "team sport", "word_list": ["soccer", "basketball", "baseball", "hockey", "volleyball", "rugby", "cricket", "football", "handball", "lacrosse", "dodgeball", "netball", "softball", "polo", "curling", "ultimate"]},
+        {"category": "weather event", "word_list": ["rain", "snow", "hail", "fog", "thunder", "lightning", "tornado", "hurricane", "blizzard", "drizzle", "sleet", "frost", "mist", "monsoon", "cyclone", "typhoon"]},
+        {"category": "medical profession", "word_list": ["surgeon", "nurse", "dentist", "pediatrician", "radiologist", "anesthesiologist", "pharmacist", "paramedic", "midwife", "therapist", "cardiologist", "dermatologist", "optometrist", "psychiatrist", "veterinarian", "chiropractor"]},
+        {"category": "watercraft", "word_list": ["canoe", "kayak", "sailboat", "yacht", "ferry", "submarine", "raft", "catamaran", "gondola", "tugboat", "barge", "dinghy", "schooner", "trawler", "houseboat", "hovercraft"]},
+        {"category": "office supply", "word_list": ["stapler", "paperclip", "envelope", "notebook", "highlighter", "tape", "scissors", "binder", "folder", "eraser", "ruler", "calculator", "whiteboard", "marker", "clipboard", "pushpin"]}
     ],
     "initial_state": "Clue",
     "state_transition": {
         "Clue": "Discussion",
         "Discussion": "Vote",
-        "Vote": "Guess"
+        "Vote": "Guess",
+        "TieBreak": "Guess"
     },
     "state_properties": {
-        "Clue": {"actions": ["action"], "action_order": "round-robin", "visibility": "public"},
-        "Discussion": {"actions": ["speak"], "action_order": "round-robin", "visibility": "public"},
-        "Vote": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"},
-        "Guess": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Clue": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "round-robin",
+            "visibility": "public"
+        },
+        "Discussion": {
+            "actions": [
+                "speak"
+            ],
+            "action_order": "round-robin",
+            "visibility": "public"
+        },
+        "Vote": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        },
+        "TieBreak": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        },
+        "Guess": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "simultaneous",
+            "visibility": "public"
+        }
     },
     "end_conditions": [],
     "agents": [
-        {"name": "Alice", "role": "Chameleon", "team": "Chameleon", "agent_model": "gpt-4o"},
-        {"name": "Bob", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
-        {"name": "Charlie", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
-        {"name": "Diana", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"},
-        {"name": "Eve", "role": "Citizen", "team": "Citizens", "agent_model": "gpt-4o"}
+        {
+            "name": "Alice",
+            "role": "Chameleon",
+            "team": "Chameleon",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Bob",
+            "role": "Citizen",
+            "team": "Citizens",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Charlie",
+            "role": "Citizen",
+            "team": "Citizens",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Diana",
+            "role": "Citizen",
+            "team": "Citizens",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Eve",
+            "role": "Citizen",
+            "team": "Citizens",
+            "agent_model": "gpt-4o"
+        }
     ]
 }

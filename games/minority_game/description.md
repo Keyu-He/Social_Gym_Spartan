@@ -26,7 +26,13 @@ Win conditions:
 - Top half of players by score: +1.0
 - Bottom half: -1.0
 - Middle (if odd number of players): 0.0
+- Players tied on score share one result: a tied group inside the top half wins, inside the bottom half loses, and one straddling a boundary draws (0.0). Seating order never decides. The description, the goal and every turn's instruction state this rule, with two worked examples (30, 30, 30, 12, 12: three draws and two losses; 30, 20, 20, 12, 12: a win, two draws and two losses).
 - All tied: Draw (0.0 each)
+
+The game description, the goal line and each turn's instruction all state this one rule.
+
+## Unclear replies
+A reply that does not name exactly one of `go` or `stay` (including a failed model call) is not read as a move. A move word right after a negation in its clause ("don't go", "I won't stay") does not name that move, so "I won't stay, I go" is go. The engine says so to everyone and asks that player once more; every other move stays hidden, because replies in this state are private and the round results report only the parsed moves. If the second reply is also unclear, the move is drawn at random, each move equally likely, from a stream seeded by the roster. The round results mark a drawn move. The match still lasts 12 rounds; a round with a repeated reply takes one extra step.
 
 ## Social Skills Tested
 - **Anti-coordination:** Unlike most games where you want to match the group, here you must predict and avoid the majority choice.

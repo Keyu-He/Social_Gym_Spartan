@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -60,23 +61,53 @@ class BattleOfSexesEvaluator(SocialGameEndEvaluator):
         return [("environment", (("terminated", False), ""))]
 
 
+MOVES = ("opera", "football")
+
+
+# A move word right after a negation in its clause ("I will not swerve", "don't defect") does not name that move.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def names(text: str, word: str) -> bool:
+    """True when `text` uses `word` as a whole word at least once with no negation right before it."""
+    return any(not is_negated(text, m.start()) for m in re.finditer(rf"\b{word}\b", text))
+
+
+def read_move(argument: str) -> str | None:
+    """'opera' or 'football' when the choice names exactly one venue as a word, else None.
+
+    A negated venue is not named, so "not football, opera" is opera. A choice naming both venues ("I
+    understand your preference for football, but I'm proposing we go to opera") or neither ("I won't go
+    to opera") is not read as a move; the player is asked again.
+    """
+    text = argument.lower().replace("’", "'")
+    named = [m for m in MOVES if names(text, m)]
+    return named[0] if len(named) == 1 else None
+
+
 class BattleOfSexesActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
         if not isinstance(env, BattleOfSexesEnv):
             return
-        if action.action_type not in ["action", "speak"]:
+        if env.current_state != "Choose" or agent_name not in env.awaiting():
             return
-        if env.current_state == "Choose":
-            tokens = re.findall(r"[a-z]+", action.argument.lower())
-            for tok in tokens:
-                if tok == "opera":
-                    env.internal_state["current_moves"][agent_name] = "opera"
-                    break
-                if tok == "football":
-                    env.internal_state["current_moves"][agent_name] = "football"
-                    break
+        move = (
+            read_move(action.argument)
+            if action.action_type in ["action", "speak"]
+            else None
+        )
+        env.take_reply(agent_name, move)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, BattleOfSexesEnv):
@@ -93,12 +124,19 @@ class BattleOfSexesActionHandler(ActionHandler):
                 f"Mismatch: 0,0. Speak freely to coordinate."
             )
         if env.current_state == "Choose":
-            return (
+            text = (
                 f"Round {round_num}/{max_rounds}. Scores: {scores}. "
                 f"CHOICE PHASE: Simultaneously choose 'opera' or 'football'. "
                 f"Opera: {agents[0]}=3, {agents[1]}=2. Football: {agents[0]}=2, {agents[1]}=3. "
-                f"Mismatch: 0,0. Higher total score wins."
+                f"Mismatch: 0,0. Higher total score wins. Equal totals are a draw. "
+                f"Name exactly one venue in your choice."
             )
+            if env.internal_state.get("unclear", {}).get(agent_name):
+                text += (
+                    " Your last choice did not name exactly one of 'opera' or 'football', so you are asked again."
+                    " If this choice is also unclear, your venue is drawn at random."
+                )
+            return text
         return ""
 
 
@@ -127,27 +165,73 @@ class BattleOfSexesEnv(SocialDeductionGame):
             "round": 0,
             "scores": {name: 0 for name in self.agents},
             "current_moves": {},
+            "unclear": {},
+            "drawn": [],
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Venues drawn for twice-unclear choices; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         return obs
 
-    def _check_eliminations(self) -> None:
-        if not self._should_transition_state():
-            return
+    def awaiting(self) -> List[str]:
+        """Players whose venue for the current round is not in yet (both, at the start of a Choose phase)."""
+        moves = self.internal_state.get("current_moves", {})
+        return [a for a in self.agents if a not in moves]
 
-        if self.current_state == "Choose":
-            moves = self.internal_state.setdefault("current_moves", {})
-            # Default-and-continue: agents whose action didn't parse use the
-            # default so the round always resolves and stale data can't carry
-            # into the next round.
-            for agent in self.agents:
-                moves.setdefault(agent, "opera")
+    def take_reply(self, agent_name: str, move: str | None) -> None:
+        """Hold a clear venue; ask an unclear (or failed) choice once more, then draw the venue at random.
+
+        Each venue is equally likely, so neither seat's preferred venue is the default. Choices stay
+        hidden until the round is complete: the Choose state is private, so a player asked again
+        never sees the other player's choice.
+        """
+        if move is not None:
+            self.internal_state["current_moves"][agent_name] = move
+            return
+        unclear = self.internal_state.setdefault("unclear", {})
+        unclear[agent_name] = unclear.get(agent_name, 0) + 1
+        round_num = self.internal_state.get("round", 0) + 1
+        if unclear[agent_name] == 1:
+            message = (
+                f"[Round {round_num}] {agent_name}'s choice did not name exactly one of 'opera' or 'football', "
+                f"so {agent_name} is asked again. Choices stay hidden until the round is complete."
+            )
+        else:
+            self.internal_state["current_moves"][agent_name] = (
+                self._fallback_rng.choice(MOVES)
+            )
+            self.internal_state.setdefault("drawn", []).append(agent_name)
+            message = (
+                f"[Round {round_num}] {agent_name}'s second choice was also unclear, "
+                f"so {agent_name}'s venue is drawn at random."
+            )
+        self.recv_message("Environment", SimpleMessage(message=message))
+
+    def _update_action_mask(self) -> None:
+        super()._update_action_mask()
+        if self.current_state == "Choose" and "current_moves" in self.internal_state:
+            due = self.awaiting()
+            self.action_mask = [a in due for a in self.agents]
+
+    def _should_transition_state(self) -> bool:
+        # Stay in Choose while a player is being asked again; Discuss follows a complete round.
+        if self.current_state == "Choose" and (
+            self.internal_state.get("current_moves")
+            or self.internal_state.get("unclear")
+        ):
+            return False
+        return super()._should_transition_state()
+
+    def _check_eliminations(self) -> None:
+        if self.current_state == "Choose" and not self.awaiting():
+            moves = self.internal_state["current_moves"]
+            drawn = self.internal_state.get("drawn", [])
             agents = list(self.agents)
             a1, a2 = agents[0], agents[1]
-            m1 = moves.get(a1, "opera")
-            m2 = moves.get(a2, "opera")
+            m1 = moves[a1]
+            m2 = moves[a2]
 
             payoff_matrix = self._config.get("payoff_matrix", {})
             try:
@@ -163,11 +247,16 @@ class BattleOfSexesEnv(SocialDeductionGame):
             round_num = self.internal_state["round"] + 1
             self.internal_state["round"] = round_num
             self.internal_state["current_moves"] = {}
+            self.internal_state["unclear"] = {}
+            self.internal_state["drawn"] = []
+
+            def shown(name: str, move: str) -> str:
+                return f"{move} (drawn at random)" if name in drawn else move
 
             self.recv_message(
                 "Environment",
                 SimpleMessage(
-                    message=f"[Round {round_num}] {a1} chose {m1}, {a2} chose {m2}. "
+                    message=f"[Round {round_num}] {a1} chose {shown(a1, m1)}, {a2} chose {shown(a2, m2)}. "
                     f"Payoff: {a1}={r1}, {a2}={r2}. Scores: {scores}"
                 ),
             )
@@ -303,8 +392,12 @@ def prepare_scenario(
         for entry in config.get("agents", [])
     ]
     agent_names = [entry.get("name", "") for entry in config.get("agents", [])]
+    # The rules text names the seated players: the first-listed player (seat 0) prefers opera,
+    # as in payoff_matrix, which pays [seat 0, seat 1].
     scenario = config.get("description", "Battle of the Sexes").format(
-        agent_names=", ".join(agent_names)
+        agent_names=", ".join(agent_names),
+        opera_player=agent_names[0] if agent_names else "the first player",
+        football_player=agent_names[1] if len(agent_names) > 1 else "the second player",
     )
     env_profile = EnvironmentProfile(
         scenario=scenario,

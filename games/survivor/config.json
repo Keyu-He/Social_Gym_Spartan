@@ -1,6 +1,6 @@
 {
     "scenario": "Survivor",
-    "description": "Each round: discuss freely, then vote someone out. No hidden roles or secrets. Eliminated players become jurors who pick the final winner from the last 2-3 survivors. You need allies to survive but victims' goodwill to win the jury vote. Players: {agent_names}.",
+    "description": "Each round, every player still in the game speaks once, in seat order, and then everyone votes someone out. No hidden roles or secrets. The player with the most votes is eliminated; a tie for the most votes is settled by a random draw among the tied players, and a round in which no ballot counts eliminates nobody. Eliminated players become jurors who pick the final winner from the last 3 survivors, after each finalist makes one plea to the jury, in seat order. You need allies to survive but victims' goodwill to win the jury vote. Scoring: the jury's pick scores 1, the other finalists 0 and every eliminated player -1; finalists tied for the most jury votes share the 1 equally. Players: {agent_names}.",
     "role_goals": {
         "Player": "Survive to the final round and win the jury vote. Remember: the people you vote out will decide if you win!"
     },

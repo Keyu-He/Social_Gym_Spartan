@@ -1,13 +1,13 @@
 {
     "scenario": "Spyfall",
-    "description": "A social deduction game where players are at a specific location, but one player is a Spy who doesn't know where they are. GAME STRUCTURE: One Spy, multiple Non-Spies. WIN CONDITIONS: Non-Spies win by identifying and voting out the Spy. The Spy wins by avoiding detection (surviving until parity with Non-Spies). PHASES: (1) Questioning: Players take turns asking questions to each other to prove they know the location without giving it away to the Spy. (2) Voting: Players vote to eliminate the suspected Spy. STRATEGY: Non-Spies must be subtle; Spies must listen and blend in. \n\n The players in this game are: {agent_names}.",
+    "description": "A social deduction game where players are at a specific location, but one player is a Spy who doesn't know where they are. GAME STRUCTURE: One Spy, multiple Non-Spies. WIN CONDITIONS: Non-Spies win by identifying and voting out the Spy. The Spy wins by avoiding detection (surviving until parity with Non-Spies, or until time runs out) or by correctly guessing the location; a wrong guess makes the Non-Spies win. PHASES: (1) Questioning: Players take turns asking questions to each other to prove they know the location without giving it away to the Spy. On the Spy's own questioning turn, instead of speaking, the Spy may stop the game, reveal being the Spy and guess the location with the action 'guess LOCATION', naming one of the possible locations (the Spy has the list); a correct guess wins the game for the Spy, a wrong guess (or one that names no single location from the list) makes the Non-Spies win. The Spy cannot guess during a vote. (2) Voting: Players vote to eliminate the suspected Spy. The player with the most counted votes is out; if the top vote is tied, one of the tied players is drawn at random and the draw is announced. Only players still in the game can be voted for; a vote for a player who is already out, or a vote that names no single player, counts as an abstention. TIME LIMIT: The game lasts at most 20 turns. Each questioning turn and each vote counts as one turn, so a round with N players still in takes N + 1 turns. If the 20th turn ends without the Spy being voted out or guessing the location, time runs out and the Spy wins. STRATEGY: Non-Spies must be subtle; Spies must listen and blend in. \n\n The players in this game are: {agent_names}.",
     "role_goals": {
         "Non-Spy": "Identify the Spy without revealing the location too clearly.",
         "Spy": "Figure out the location and blend in as a Non-Spy."
     },
     "role_secrets": {
         "Non-Spy": "The location is: {location}.",
-        "Spy": "You are the Spy. You do NOT know the location."
+        "Spy": "You are the Spy. You do NOT know the location. The possible locations are: {location_list}."
     },
     "location_pool": [
         "Airplane",

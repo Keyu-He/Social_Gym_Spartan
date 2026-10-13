@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import random
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -39,11 +41,27 @@ _gen_logger = logging.getLogger("sotopia.generation")
 _env_logger = logging.getLogger("sotopia.envs.social_game")
 
 
+def turn_limit(config: Dict[str, Any]) -> int:
+    """Env steps a match may take: every decision of every game, each asked at most twice.
+
+    One unclear reply is asked again and a second one is replaced by a random move, so a match
+    can never need more; the limit only guards against a stalled engine.
+    """
+    return 2 * config.get("num_games", 4) * len(config.get("nodes", []))
+
+
 class CentipedeEvaluator(SocialGameEndEvaluator):
     def __call__(
         self, turn_number: int, messages: List[Tuple[str, Message]], **kwargs: Any
     ) -> List[Tuple[str, Tuple[Tuple[str, int | float | bool], str]]]:
         env = kwargs.get("env")
+        if (
+            env
+            and not env.internal_state.get("game_over", False)
+            and turn_number >= self.max_turn_number
+        ):
+            # The turn limit ends the match as its last game would: the higher cumulative score wins.
+            env.finish_match(f"Turn limit of {self.max_turn_number} reached.")
         if env and env.internal_state.get("game_over", False):
             scores = env.internal_state.get("final_scores", {})
             reason = env.internal_state.get("end_reason", "Game over")
@@ -59,24 +77,72 @@ class CentipedeEvaluator(SocialGameEndEvaluator):
         return [("environment", (("terminated", False), ""))]
 
 
+# A move word right after a negation in its clause ("I will not swerve", "don't defect") does not name that move.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def names(text: str, word: str) -> bool:
+    """True when `text` uses `word` as a whole word at least once with no negation right before it."""
+    return any(not is_negated(text, m.start()) for m in re.finditer(rf"\b{word}\b", text))
+
+
+def read_move(argument: str) -> str | None:
+    """'take' or 'pass' when the reply names exactly one of them as a word, else None.
+
+    A negated move is not named, so "I will not take, I pass" is pass. A reply naming both ("take or pass")
+    or neither ("I won't take") is not read as a move; the engine says so publicly and the same player
+    chooses again.
+    """
+    text = argument.lower().replace("’", "'")
+    said = [m for m in ("take", "pass") if names(text, m)]
+    return said[0] if len(said) == 1 else None
+
+
 class CentipedeActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
         if not isinstance(env, CentipedeEnv):
             return
-        if action.action_type != "action":
+        if env.current_state != "Turn":
             return
-        if env.current_state == "Turn":
-            agents = list(env.agents)
-            current_idx = env.internal_state.get("current_player_idx", 0)
-            if agent_name != agents[current_idx]:
-                return
-            move = action.argument.lower()
-            if "take" in move:
-                env.internal_state["decision"] = "take"
-            elif "pass" in move:
-                env.internal_state["decision"] = "pass"
+        agents = list(env.agents)
+        current_idx = env.internal_state.get("current_player_idx", 0)
+        if agent_name != agents[current_idx]:
+            return
+        move = read_move(action.argument) if action.action_type == "action" else None
+        if move:
+            env.internal_state["decision"] = move
+            env.internal_state["unclear"] = 0
+            return
+        game_num = env.internal_state.get("game_num", 0) + 1
+        unclear = env.internal_state.get("unclear", 0) + 1
+        env.internal_state["unclear"] = unclear
+        # The announcement never quotes the reply: the players cannot talk, so only parsed moves are shown.
+        if unclear == 1:
+            message = (
+                f"[Game {game_num}] {agent_name}'s reply did not name exactly one of 'take' or 'pass', "
+                f"so {agent_name} is asked once more."
+            )
+        else:
+            # Asked once already: the move is drawn at random, take and pass equally likely.
+            drawn = env._fallback_rng.choice(("take", "pass"))
+            env.internal_state["decision"] = drawn
+            env.internal_state["unclear"] = 0
+            message = (
+                f"[Game {game_num}] {agent_name}'s second reply was also unclear, "
+                f"so {agent_name}'s move is drawn at random: {drawn}."
+            )
+        env.recv_message("Environment", SimpleMessage(message=message))
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, CentipedeEnv):
@@ -86,38 +152,47 @@ class CentipedeActionHandler(ActionHandler):
             current_idx = env.internal_state.get("current_player_idx", 0)
             current_player = agents[current_idx]
             node = env.internal_state.get("current_node", 0)
-            game_num = env.internal_state.get("game_num", 0) + 1
+            game_idx = env.internal_state.get("game_num", 0)
             num_games = env._config.get("num_games", 4)
             nodes = env._config.get("nodes", [])
             scores = env.internal_state.get("scores", {})
 
             if agent_name != current_player:
                 return (
-                    f"Game {game_num}/{num_games}. "
+                    f"Game {game_idx + 1}/{num_games}. "
                     f"Waiting for {current_player} to decide. "
                     f"Cumulative scores: {scores}"
                 )
 
             actor = agents[current_idx]
             other = agents[1 - current_idx]
-            if node < len(nodes):
-                take_payoffs = nodes[node]
-                payoff_str = (
-                    f"Take now: you ({actor})={take_payoffs[0]}, "
-                    f"{other}={take_payoffs[1]}"
-                )
-            else:
-                pass_payoff = env._config.get("pass_through_payoff", [0, 0])
-                payoff_str = (
-                    f"Final: you ({actor})={pass_payoff[0]}, {other}={pass_payoff[1]}"
-                )
+            first, _ = env.movers(game_idx)
+            role = "first" if actor == first else "second"
+            now = env.shares(game_idx, node)
+            # The rest of the tree from here, in the mover's own terms (complete information).
+            tree = []
+            for k in range(node, len(nodes)):
+                p = env.shares(game_idx, k)
+                mover = "you move" if (k - node) % 2 == 0 else f"{other} moves"
+                tree.append(f"node {k + 1} ({mover}): ({p[actor]}, {p[other]})")
+            through = env.shares(game_idx, len(nodes))
+            tree.append(f"if node {len(nodes)} is passed: ({through[actor]}, {through[other]})")
 
-            return (
-                f"Game {game_num}/{num_games}, Node {node + 1}/{len(nodes)}. "
-                f"Your turn! Choose 'take' or 'pass'. "
-                f"{payoff_str}. Pass = pot grows but opponent decides next. "
-                f"Cumulative scores: {scores}"
+            text = (
+                f"Game {game_idx + 1}/{num_games}, Node {node + 1}/{len(nodes)}. "
+                f"You are the {role} mover in this game. Your turn: choose 'take' or 'pass'. "
+                f"Take now: you ({actor}) get {now[actor]}, {other} gets {now[other]}. "
+                f"Pass: the game goes on and {other} chooses at the next node. "
+                f"Payoffs (you, {other}) if the game ends at each remaining node: "
+                + "; ".join(tree)
+                + f". Cumulative scores: {scores}"
             )
+            if env.internal_state.get("unclear"):
+                text += (
+                    ". Your last reply was not a clear 'take' or 'pass'. "
+                    "If this reply is also unclear, your move is drawn at random."
+                )
+            return text
         return ""
 
 
@@ -147,11 +222,14 @@ class CentipedeEnv(SocialDeductionGame):
             "current_node": 0,
             "current_player_idx": 0,
             "decision": None,
+            "unclear": 0,
             "scores": {name: 0 for name in self.agents},
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Moves drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
         agents = list(self.agents)
         num_games = self._config.get("num_games", 4)
         self.recv_message(
@@ -162,6 +240,22 @@ class CentipedeEnv(SocialDeductionGame):
             ),
         )
         return obs
+
+    def movers(self, game_idx: int) -> Tuple[str, str]:
+        """(first mover, second mover) of game `game_idx` (0-based); the first mover alternates by seat."""
+        agents = list(self.agents)
+        return agents[game_idx % 2], agents[1 - game_idx % 2]
+
+    def shares(self, game_idx: int, node: int) -> Dict[str, int]:
+        """Points each player gets if game `game_idx` ends at `node` (0-based; node == len(nodes) is the pass-through).
+
+        The config's pairs are (first mover, second mover) of that game, the textbook centipede reading
+        (McKelvey and Palfrey 1992; description.md's table): whoever takes gets the larger share of the node.
+        """
+        nodes = self._config.get("nodes", [])
+        pair = nodes[node] if node < len(nodes) else self._config.get("pass_through_payoff", [0, 0])
+        first, second = self.movers(game_idx)
+        return {first: pair[0], second: pair[1]}
 
     def _update_action_mask(self) -> None:
         super()._update_action_mask()
@@ -189,26 +283,20 @@ class CentipedeEnv(SocialDeductionGame):
         scores = self.internal_state["scores"]
         game_num = self.internal_state["game_num"]
 
-        # Payoffs are acting-player-relative: payoffs[0] is awarded to the
-        # player whose turn it is at the node, payoffs[1] to the other player.
-        # This makes the alternating first-mover rule actually fair.
+        # Each node's pair is (first mover, second mover) of this game, whoever moves at the node.
         actor = agents[current_idx]
         other = agents[1 - current_idx]
 
         if decision == "take":
-            if node < len(nodes):
-                payoffs = nodes[node]
-            else:
-                payoffs = self._config.get("pass_through_payoff", [0, 0])
-
-            scores[actor] += payoffs[0]
-            scores[other] += payoffs[1]
+            payoffs = self.shares(game_num, node)
+            scores[actor] += payoffs[actor]
+            scores[other] += payoffs[other]
 
             self.recv_message(
                 "Environment",
                 SimpleMessage(
                     message=f"[Game {game_num + 1}] {actor} TAKES at node {node + 1}! "
-                    f"Payoffs: {actor}={payoffs[0]}, {other}={payoffs[1]}. "
+                    f"Payoffs: {actor}={payoffs[actor]}, {other}={payoffs[other]}. "
                     f"Cumulative scores: {scores}"
                 ),
             )
@@ -217,15 +305,15 @@ class CentipedeEnv(SocialDeductionGame):
         elif decision == "pass":
             next_node = node + 1
             if next_node >= len(nodes):
-                payoffs = self._config.get("pass_through_payoff", [0, 0])
-                scores[actor] += payoffs[0]
-                scores[other] += payoffs[1]
+                payoffs = self.shares(game_num, next_node)
+                scores[actor] += payoffs[actor]
+                scores[other] += payoffs[other]
 
                 self.recv_message(
                     "Environment",
                     SimpleMessage(
                         message=f"[Game {game_num + 1}] {actor} passes at final node! "
-                        f"Full cooperation! Payoffs: {actor}={payoffs[0]}, {other}={payoffs[1]}. "
+                        f"Full cooperation! Payoffs: {actor}={payoffs[actor]}, {other}={payoffs[other]}. "
                         f"Cumulative scores: {scores}"
                     ),
                 )
@@ -236,13 +324,13 @@ class CentipedeEnv(SocialDeductionGame):
                 self.internal_state["decision"] = None
 
                 next_player = other
-                next_payoffs = nodes[next_node] if next_node < len(nodes) else [0, 0]
+                next_payoffs = self.shares(game_num, next_node)
                 self.recv_message(
                     "Environment",
                     SimpleMessage(
                         message=f"[Game {game_num + 1}] {actor} passes! Pot grows. "
                         f"Now {next_player}'s turn at node {next_node + 1}. "
-                        f"Take payoffs: {next_player}={next_payoffs[0]}, {actor}={next_payoffs[1]}"
+                        f"Take payoffs: {next_player}={next_payoffs[next_player]}, {actor}={next_payoffs[actor]}"
                     ),
                 )
 
@@ -256,26 +344,7 @@ class CentipedeEnv(SocialDeductionGame):
         agents = list(self.agents)
 
         if game_num >= num_games:
-            scores = self.internal_state["scores"]
-            s1, s2 = scores[agents[0]], scores[agents[1]]
-            if s1 > s2:
-                final = {agents[0]: 1.0, agents[1]: -1.0}
-                reason = (
-                    f"All {num_games} games done. {agents[0]} wins! Final: {scores}"
-                )
-            elif s2 > s1:
-                final = {agents[0]: -1.0, agents[1]: 1.0}
-                reason = (
-                    f"All {num_games} games done. {agents[1]} wins! Final: {scores}"
-                )
-            else:
-                final = {agents[0]: 0.0, agents[1]: 0.0}
-                reason = f"All {num_games} games done. Tie! Final: {scores}"
-
-            self.internal_state["game_over"] = True
-            self.internal_state["final_scores"] = final
-            self.internal_state["end_reason"] = reason
-            self.recv_message("Environment", SimpleMessage(message=f"[Game] {reason}"))
+            self.finish_match(f"All {num_games} games done.")
         else:
             self.internal_state["game_num"] = game_num
             self.internal_state["current_node"] = 0
@@ -292,6 +361,26 @@ class CentipedeEnv(SocialDeductionGame):
             )
             if hasattr(self, "_state_turn_count"):
                 self._state_turn_count[self.current_state] = 0
+
+    def finish_match(self, head: str) -> None:
+        """End the match on the cumulative scores so far: higher wins (+1 / -1), equal is a tie (0)."""
+        agents = list(self.agents)
+        scores = self.internal_state["scores"]
+        s1, s2 = scores[agents[0]], scores[agents[1]]
+        if s1 > s2:
+            final = {agents[0]: 1.0, agents[1]: -1.0}
+            reason = f"{head} {agents[0]} wins! Final: {scores}"
+        elif s2 > s1:
+            final = {agents[0]: -1.0, agents[1]: 1.0}
+            reason = f"{head} {agents[1]} wins! Final: {scores}"
+        else:
+            final = {agents[0]: 0.0, agents[1]: 0.0}
+            reason = f"{head} Tie! Final: {scores}"
+
+        self.internal_state["game_over"] = True
+        self.internal_state["final_scores"] = final
+        self.internal_state["end_reason"] = reason
+        self.recv_message("Environment", SimpleMessage(message=f"[Game] {reason}"))
 
 
 # ============================================================================
@@ -325,7 +414,7 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[CentipedeEvaluator(max_turn_number=30)],
+        evaluators=[CentipedeEvaluator(max_turn_number=turn_limit(config))],
         terminal_evaluators=[],
         hide_unknown=True,
     )

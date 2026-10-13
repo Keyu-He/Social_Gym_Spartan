@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import logging
 import random
+import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -33,6 +36,10 @@ from sotopia.server import arun_one_episode
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 
+# Turn limit: a turn is one player's move. A game that reaches it goes to the most dice (see the evaluator). It is a
+# backstop against a game that never ends, so the models are not told about it.
+MAX_TURNS = 100
+
 os.environ.setdefault("REDIS_OM_URL", "redis://:@localhost:6379")
 redis.Redis(host="localhost", port=6379)
 
@@ -57,22 +64,30 @@ class LiarsDiceEvaluator(SocialGameEndEvaluator):
                 response: List[
                     Tuple[str, Tuple[Tuple[str, int | float | bool], str]]
                 ] = [("environment", (("terminated", True), "Max turns reached."))]
+                # Most dice wins. Players tied for the most share the win as a
+                # draw (equal rewards; the Bradley-Terry fit counts ties) rather
+                # than letting seating order decide.
                 agent_names = list(env.agents)
                 dice = env.internal_state.get("dice", {})
-                best_count = -1
-                winner_name = None
-                for name in agent_names:
-                    count = len(dice.get(name, []))
-                    if count > best_count:
-                        best_count = count
-                        winner_name = name
-                losers = [n for n in agent_names if n != winner_name]
+                counts = {name: len(dice.get(name, [])) for name in agent_names}
+                best_count = max(counts.values(), default=0)
+                winners = [n for n in agent_names if counts[n] == best_count]
+                losers = [n for n in agent_names if n not in winners]
+                if not losers:
+                    winner_score = 0.0
+                    label = "Draw (all tied on dice)"
+                elif len(winners) > 1:
+                    winner_score = 1.0 / len(winners)
+                    label = "Draw (tied for most dice)"
+                else:
+                    winner_score = 1.0
+                    label = "Winner (most dice)"
                 loser_score = -1.0 / len(losers) if losers else 0.0
                 for idx, name in enumerate(agent_names):
                     key = f"agent_{idx + 1}"
-                    if name == winner_name and best_count > 0:
+                    if name in winners:
                         response.append(
-                            (key, (("complete_rating", 1.0), "Winner (most dice)"))
+                            (key, (("complete_rating", winner_score), label))
                         )
                     else:
                         response.append(
@@ -114,31 +129,111 @@ class LiarsDiceEvaluator(SocialGameEndEvaluator):
 # Action Handler
 # ============================================================================
 
+def _shared(name: str) -> Any:
+    """A helper module shared by the games, loaded by path like the game modules themselves."""
+    key = f"games_{name}"
+    if key not in sys.modules:
+        spec = importlib.util.spec_from_file_location(key, BASE_DIR.parent / f"{name}.py")
+        assert spec and spec.loader
+        sys.modules[key] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sys.modules[key])
+    return sys.modules[key]
+
+
+committed_move = _shared("committed_move")
+
+# A call is the word 'liar' ("liar", "Liar!", "I call liar"), not "a liar", "liars" or "Liar's Dice". Perudo's
+# "dudo", "challenge" and a bare "call" ("I call", "I call your bid") are the same call; "call for", "call out",
+# "call off" and "call it a" are not.
+_LIAR = (
+    r"(?<!\ba )(?<!\ban )(?<!\bthe )\bliar\b(?!')|\bdudo\b|\bchallenge\b"
+    r"|\bcall\b(?!\s+(?:for|out|off|it\s+an?)\b)"
+)
+# 'bid QUANTITY FACE'; "Bid: 3 4", "bid 3x4", "bid 3 4s" and "bid 3 of 4s" are the same bid, and number words are
+# read as numbers ("bid three fours").
+_BID = r"\bbid\s*:?\s*(-?\d+)\s*(?:x|\u00d7|\s+of\s+|\s)\s*(-?\d+)(?:'?s)?\b"
+_NUMBER_WORDS = {
+    w: str(i)
+    for i, w in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen"
+        " seventeen eighteen nineteen twenty".split()
+    )
+}
+_FACE_WORDS = {"ones": "1s", "twos": "2s", "threes": "3s", "fours": "4s", "fives": "5s", "sixes": "6s"}
+
+
+def _numbers_as_digits(text: str) -> str:
+    """'bid three fours' -> 'bid 3 4s': quantity and face words become digits, so _BID reads them."""
+    words = {**_NUMBER_WORDS, **_FACE_WORDS}
+    return re.sub(
+        r"\b(" + "|".join(sorted(words, key=len, reverse=True)) + r")\b",
+        lambda m: words[m.group(1).lower()],
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def read_move(text: str) -> Tuple[str, int, int]:
+    """('liar', 0, 0), ('bid', quantity, face), ('unclear', 0, 0) for a reply that commits to two different
+    moves, ('malformed', 0, 0) for a 'bid' without two numbers, or ('unrecognized', 0, 0).
+
+    Only the move the reply commits to counts (committed_move): "Liar! I don't believe that bid.", "I call
+    liar on your bid", "Dudo!", "I challenge that bid" and "I call" are liar calls, and "bid three fours" is
+    bid 3 4; "I'm not going to call liar; bid 4 5", "Calling liar is too risky, so bid 4 5" and "bid 3 4, or
+    should I call liar?" are bids; "I won't call liar" is no move.
+    """
+    text = _numbers_as_digits(text)
+    move, mention, _ = committed_move.commitment(
+        text, {"liar": _LIAR, "bid": _BID}, key=lambda m: (m.move, m.match.groups())
+    )
+    if move == "unclear":
+        return "unclear", 0, 0
+    if move == "liar":
+        return "liar", 0, 0
+    if move == "bid" and mention is not None:
+        return "bid", int(mention.match.group(1)), int(mention.match.group(2))
+    if committed_move.commitment(text, {"bid": r"\bbid\b"})[0] == "bid":
+        return "malformed", 0, 0
+    return "unrecognized", 0, 0
+
+
 
 class LiarsDiceActionHandler(ActionHandler):
-    """Handles bidding and liar-calling actions."""
+    """Handles bidding and liar-calling actions.
+
+    On your turn you must raise the bid or call liar. Anything else (a bid that
+    is not higher, a malformed command, calling liar with no bid on the table,
+    or no move at all) is an illegal move and costs a die. Without that penalty
+    a player who never makes a legal bid can never be challenged, never loses
+    dice, and wins on the turn cap by default.
+
+    Every lost die ends the round, as in the published game: after a challenge
+    or an illegal move everyone re-rolls and the player who lost the die opens
+    (the next living player in seat order if it was eliminated). So nobody is
+    ever asked to raise or challenge their own bid, and no die leaves a hand
+    while bids on that round's total are still standing.
+    """
 
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
-        if action.action_type not in ["action", "speak"]:
-            return
         if not isinstance(env, LiarsDiceEnv):
             return
+        # Every agent submits an action each turn; only the one whose turn it
+        # is can make a move, legal or otherwise. The rest send "none".
+        if not self._is_acting(env, agent_name):
+            return
+        if action.action_type not in ["action", "speak"]:
+            self._penalize(env, agent_name, "made no move")
+            return
 
-        arg = action.argument.strip().lower()
+        move, quantity, face = read_move(action.argument)
 
         # Handle "liar" call
-        if "liar" in arg and "bid" not in arg:
+        if move == "liar":
             current_bid = env.internal_state.get("current_bid")
             if current_bid is None:
-                env.recv_message(
-                    "Environment",
-                    SimpleMessage(
-                        message=f"[Game] {agent_name}: No current bid to challenge. You must bid."
-                    ),
-                    receivers=[agent_name],
-                )
+                self._penalize(env, agent_name, "called liar with no bid on the table")
                 return
 
             bid_quantity = current_bid["quantity"]
@@ -181,140 +276,151 @@ class LiarsDiceActionHandler(ActionHandler):
             dice_reveal += ", ".join(dice_parts)
             env.recv_message("Environment", SimpleMessage(message=dice_reveal))
 
-            # Remove a die from the loser
-            loser_dice = dice.get(loser, [])
-            if loser_dice:
-                loser_dice.pop()
-                dice[loser] = loser_dice
+            self._end_round(env, loser)
+            return
 
-            if len(dice.get(loser, [])) == 0:
-                env.agent_alive[loser] = False
-                env.recv_message(
-                    "Environment",
-                    SimpleMessage(
-                        message=f"[Game] {loser} has lost all dice and is eliminated!"
-                    ),
-                )
-
-            # Reset for new round
-            env.internal_state["current_bid"] = None
-            env.internal_state["round"] = env.internal_state.get("round", 0) + 1
-            env.internal_state["needs_reroll"] = True
-
-            # Determine next start player
-            if env.agent_alive.get(loser, False):
-                next_start = loser
-            elif env.agent_alive.get(agent_name, False):
-                next_start = agent_name
-            else:
-                next_start = None
-                for pname in env.agents:
-                    if env.agent_alive.get(pname, False):
-                        next_start = pname
-                        break
-            env.internal_state["next_start_player"] = next_start
-
-            # Reset turn counter so the self-loop state doesn't transition
-            if hasattr(env, "_state_turn_count"):
-                env._state_turn_count[env.current_state] = 0
-
-            # Set round-robin index to the next start player
-            if next_start:
-                eligible_indices = [
-                    idx
-                    for idx, name in enumerate(env.agents)
-                    if env.agent_alive.get(name, False)
-                ]
-                try:
-                    target_idx = list(env.agents).index(next_start)
-                    rr_pos = eligible_indices.index(target_idx)
-                    env._round_robin_idx = rr_pos
-                except (ValueError, IndexError):
-                    env._round_robin_idx = 0
-            else:
-                env._round_robin_idx = 0
+        if move == "unclear":
+            self._penalize(
+                env,
+                agent_name,
+                f"gave an unclear move '{action.argument}' (it commits to more than one move)",
+            )
             return
 
         # Handle "bid QUANTITY FACE"
-        if "bid" in arg:
-            parts = arg.split()
-            bid_idx = None
-            for i, p in enumerate(parts):
-                if p == "bid":
-                    bid_idx = i
-                    break
-
-            if bid_idx is not None and bid_idx + 2 < len(parts):
-                try:
-                    quantity = int(parts[bid_idx + 1])
-                    face = int(parts[bid_idx + 2])
-                except (ValueError, IndexError):
-                    env.recv_message(
-                        "Environment",
-                        SimpleMessage(
-                            message=f"[Game] {agent_name}: Invalid bid. Use 'bid QUANTITY FACE' (e.g., 'bid 3 4')."
-                        ),
-                        receivers=[agent_name],
-                    )
-                    return
-
-                if face < 1 or face > 6:
-                    env.recv_message(
-                        "Environment",
-                        SimpleMessage(
-                            message=f"[Game] {agent_name}: Face must be 1-6."
-                        ),
-                        receivers=[agent_name],
-                    )
-                    return
-
-                if quantity < 1:
-                    env.recv_message(
-                        "Environment",
-                        SimpleMessage(
-                            message=f"[Game] {agent_name}: Quantity must be at least 1."
-                        ),
-                        receivers=[agent_name],
-                    )
-                    return
-
-                current_bid = env.internal_state.get("current_bid")
-                if current_bid is not None:
-                    curr_q = current_bid["quantity"]
-                    curr_f = current_bid["face"]
-                    if quantity < curr_q or (quantity == curr_q and face <= curr_f):
-                        env.recv_message(
-                            "Environment",
-                            SimpleMessage(
-                                message=f"[Game] {agent_name}: Bid ({quantity}x {face}s) must be higher than "
-                                f"current ({curr_q}x {curr_f}s). Increase quantity or same quantity with higher face."
-                            ),
-                            receivers=[agent_name],
-                        )
-                        return
-
-                env.internal_state["current_bid"] = {
-                    "quantity": quantity,
-                    "face": face,
-                    "bidder": agent_name,
-                }
-                env.recv_message(
-                    "Environment",
-                    SimpleMessage(
-                        message=f"[Game] {agent_name} bids {quantity}x {face}s."
-                    ),
+        if move == "malformed":
+            self._penalize(
+                env,
+                agent_name,
+                f"made a malformed bid '{action.argument}' (use 'bid QUANTITY FACE')",
+            )
+            return
+        if move == "bid":
+            if face < 1 or face > 6:
+                self._penalize(
+                    env, agent_name, f"bid on face {face} (faces are 1-6)"
                 )
                 return
 
-        # Unrecognized
+            if quantity < 1:
+                self._penalize(env, agent_name, f"bid a quantity of {quantity}")
+                return
+
+            current_bid = env.internal_state.get("current_bid")
+            if current_bid is not None:
+                curr_q = current_bid["quantity"]
+                curr_f = current_bid["face"]
+                if quantity < curr_q or (quantity == curr_q and face <= curr_f):
+                    self._penalize(
+                        env,
+                        agent_name,
+                        f"bid {quantity}x {face}s, which is not higher than the current "
+                        f"{curr_q}x {curr_f}s",
+                    )
+                    return
+
+            env.internal_state["current_bid"] = {
+                "quantity": quantity,
+                "face": face,
+                "bidder": agent_name,
+            }
+            env.recv_message(
+                "Environment",
+                SimpleMessage(
+                    message=f"[Game] {agent_name} bids {quantity}x {face}s."
+                ),
+            )
+            return
+
+        self._penalize(
+            env,
+            agent_name,
+            f"gave an unrecognized action '{action.argument}' (use 'bid QUANTITY FACE' or 'liar')",
+        )
+
+    @staticmethod
+    def _is_acting(env: LiarsDiceEnv, agent_name: str) -> bool:
+        """Whether it is this agent's turn (the mask is still this turn's)."""
+        try:
+            return bool(env.action_mask[list(env.agents).index(agent_name)])
+        except (ValueError, IndexError):
+            return False
+
+    def _penalize(self, env: LiarsDiceEnv, agent_name: str, reason: str) -> None:
+        """Charge a die for an illegal move; like a lost challenge, it ends the round."""
         env.recv_message(
             "Environment",
             SimpleMessage(
-                message=f"[Game] {agent_name}: Unrecognized action '{action.argument}'. "
-                f"Use 'bid QUANTITY FACE' or 'liar'."
+                message=f"[Game] {agent_name} {reason}. Illegal move: {agent_name} forfeits a die "
+                f"and the round ends."
             ),
-            receivers=[agent_name],
         )
+        self._end_round(env, agent_name)
+
+    def _end_round(self, env: LiarsDiceEnv, loser: str) -> None:
+        """``loser`` loses a die; everyone re-rolls and the loser opens the next round.
+
+        If the loser is eliminated, the next living player after it in seat order opens.
+        The re-roll happens inside this step, so the observations built at the end of the
+        step (including the next opener's "Your dice" instruction) already show the new
+        round's dice; deferring the roll to the next step made openers bid on the previous
+        round's dice.
+        """
+        self._remove_die(env, loser)
+        env.internal_state["current_bid"] = None
+        env.internal_state["round"] = env.internal_state.get("round", 0) + 1
+        env._reroll_all_dice()
+        env.internal_state["needs_reroll"] = False
+        if env.agent_alive.get(loser, False):
+            next_start = loser
+        else:
+            next_start = self._next_alive_after(env, loser)
+        env.internal_state["next_start_player"] = next_start
+        self._set_next_actor(env, next_start)
+
+    @staticmethod
+    def _remove_die(env: LiarsDiceEnv, agent_name: str) -> bool:
+        """Take one die away; return True if that eliminated the player."""
+        dice = env.internal_state.get("dice", {})
+        hand = dice.get(agent_name, [])
+        if hand:
+            hand.pop()
+            dice[agent_name] = hand
+        if hand:
+            return False
+        env.agent_alive[agent_name] = False
+        env.recv_message(
+            "Environment",
+            SimpleMessage(
+                message=f"[Game] {agent_name} has lost all dice and is eliminated!"
+            ),
+        )
+        return True
+
+    @staticmethod
+    def _next_alive_after(env: LiarsDiceEnv, agent_name: str) -> str | None:
+        names = list(env.agents)
+        start = names.index(agent_name)
+        for offset in range(1, len(names) + 1):
+            candidate = names[(start + offset) % len(names)]
+            if env.agent_alive.get(candidate, False):
+                return candidate
+        return None
+
+    @staticmethod
+    def _set_next_actor(env: LiarsDiceEnv, agent_name: str | None) -> None:
+        """Make ``agent_name`` act next without breaking the seating order.
+
+        Bidding loops on itself, and the base class resets the round-robin
+        pointer whenever the state's turn count reaches the number of living
+        players. Keeping pointer and count equal makes that reset coincide with
+        the pointer wrapping, so nobody is skipped or acts twice in a row.
+        """
+        alive = [name for name in env.agents if env.agent_alive.get(name, False)]
+        pos = alive.index(agent_name) if agent_name in alive else 0
+        env._round_robin_idx = pos
+        if hasattr(env, "_state_turn_count"):
+            env._state_turn_count[env.current_state] = pos
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, LiarsDiceEnv):
@@ -349,6 +455,10 @@ class LiarsDiceActionHandler(ActionHandler):
                 f"(by {current_bid['bidder']}). "
                 f"Raise with 'bid QUANTITY FACE' or call 'liar' to challenge."
             )
+        instruction += (
+            " An illegal move (a bid that is not higher, a malformed command, a reply that commits to two"
+            " different moves, or no move) costs you a die and ends the round."
+        )
 
         return instruction
 
@@ -389,6 +499,9 @@ class LiarsDiceEnv(SocialDeductionGame):
             include_background_observations=include_background_observations,
         )
         starting_dice = self._config.get("starting_dice", 5)
+        # Dice come from the roster seed, so a roster replays the same rolls (an unseeded config rolls fresh dice)
+        seed = self._config.get("seed")
+        self._dice_rng = random.Random(f"{seed}-dice") if seed is not None else random.Random()
         self.internal_state = {
             "dice": {},
             "current_bid": None,
@@ -397,9 +510,7 @@ class LiarsDiceEnv(SocialDeductionGame):
             "next_start_player": None,
         }
         for agent_name in self.agents:
-            self.internal_state["dice"][agent_name] = [
-                random.randint(1, 6) for _ in range(starting_dice)
-            ]
+            self.internal_state["dice"][agent_name] = self._roll(starting_dice)
         # Privately reveal dice
         for agent_name in self.agents:
             my_dice = self.internal_state["dice"][agent_name]
@@ -415,6 +526,20 @@ class LiarsDiceEnv(SocialDeductionGame):
                 message=f"[Game] Round 1 begins. Total dice: {total_dice}. Bidding starts!"
             ),
         )
+        # The base reset built each agent's action instruction before the dice existed
+        # ("Your dice: []"); rebuild it so the round-1 opener bids on its real dice, and deliver
+        # the private roll and the round start now instead of one turn late.
+        for agent_name in self.agents:
+            if agent_name not in obs:
+                continue
+            if self.action_handler:
+                obs[agent_name].action_instruction = self.action_handler.get_action_instruction(
+                    self, agent_name
+                )
+            buffered = self.agent_message_buffer[agent_name]
+            if buffered:
+                obs[agent_name].last_turn = "\n".join(buffered)
+                buffered.clear()
         return obs
 
     async def astep(
@@ -433,6 +558,11 @@ class LiarsDiceEnv(SocialDeductionGame):
 
         return await super().astep(actions)
 
+    def _roll(self, n: int) -> List[int]:
+        if not hasattr(self, "_dice_rng"):
+            self._dice_rng = random.Random()
+        return [self._dice_rng.randint(1, 6) for _ in range(n)]
+
     def _reroll_all_dice(self) -> None:
         dice = self.internal_state.get("dice", {})
         round_num = self.internal_state.get("round", 1)
@@ -441,7 +571,7 @@ class LiarsDiceEnv(SocialDeductionGame):
             if self.agent_alive.get(agent_name, False):
                 num_dice = len(dice.get(agent_name, []))
                 if num_dice > 0:
-                    dice[agent_name] = [random.randint(1, 6) for _ in range(num_dice)]
+                    dice[agent_name] = self._roll(num_dice)
                     self.recv_message(
                         "Environment",
                         SimpleMessage(
@@ -499,7 +629,7 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[LiarsDiceEvaluator(max_turn_number=100)],
+        evaluators=[LiarsDiceEvaluator(max_turn_number=int(config.get("max_turns", MAX_TURNS)))],
         terminal_evaluators=[],
         hide_unknown=True,
     )

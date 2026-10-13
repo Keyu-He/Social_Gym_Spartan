@@ -1,8 +1,8 @@
 {
     "scenario": "Centipede Game",
-    "description": "Two players play 4 rounds of the Centipede Game. First mover alternates each round so each player starts twice. In each game, players alternate choosing 'take' (end game, claim current payoffs) or 'pass' (pot grows, opponent's turn). The pot grows exponentially -- taking early is safe but low-reward, passing is risky but grows the prize. Cumulative score determines the winner. Players: {agent_names}.",
+    "description": "Two players play 4 rounds of the Centipede Game. First mover alternates each round so each player starts twice. In each game the players move in turn, the first mover at nodes 1, 3 and 5 and the second mover at nodes 2, 4 and 6. The player to move chooses 'take' (the game ends and both players receive that node's payoffs) or 'pass' (the game goes on to the next node, where the other player chooses). Payoffs as (first mover, second mover): node 1 (2, 0), node 2 (1, 4), node 3 (6, 2), node 4 (5, 10), node 5 (14, 8), node 6 (13, 24); if the second mover also passes at node 6, the game ends with (24, 16). Whoever takes gets the larger share of that node, and the total grows with every pass. Cumulative score determines the winner. Equal cumulative scores are a draw. You cannot speak to the other player; the other player sees only your parsed move, never the text of your reply. Unclear replies: a reply that does not name exactly one of 'take' or 'pass' (a move word right after a negation, as in 'I will not take', does not name that move), or that fails, is announced and the same player is asked once more; if the second reply is also unclear, that player's move is drawn at random, take and pass equally likely. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your cumulative score across 4 games."
+        "Player": "Maximize your cumulative score across 4 games. Equal cumulative scores are a draw."
     },
     "role_secrets": {},
     "num_games": 4,
@@ -20,6 +20,6 @@
         "Turn": "Turn"
     },
     "state_properties": {
-        "Turn": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Turn": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -70,84 +71,152 @@ class BargainingEvaluator(SocialGameEndEvaluator):
 # ============================================================================
 
 
+TOKENS = 10
+
+# Forms that name what the proposer keeps ("offer 6", "I keep 6", "6 for me") and what the responder gets
+# ("you get 4", "offer you 4", "4 for you"). 'offer N' always counts the tokens the proposer keeps, as the rules
+# define it, so "offer 4 to you" reads both keep 4 and keep 6 and is unclear, like "I offer 4 tokens to you".
+_KEEP_FORMS = re.compile(
+    r"\b(?<!you )(?:offer|offering|keep|keeping|take|taking)\s*(?:to\s+keep\s*)?[:=]?\s*['\"]?(-?\d+)\b"
+    r"|\b(-?\d+)\s*(?:tokens?\s+)?for\s+me\b"
+)
+_GIVE_FORMS = re.compile(
+    r"\b(?:you\s+(?:get|receive|keep|take|would\s+get)|give\s+you|offer\s+you|offering\s+you)\s*[:=]?\s*(-?\d+)\b"
+    r"|\b(-?\d+)\s*(?:tokens?\s+)?(?:for|to)\s+you\b"
+)
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|neither|nor|cannot|don'?t|won'?t|can'?t|shouldn'?t|wouldn'?t)\b|n't\b"
+)
+_CLAUSE_BREAK = re.compile(r"[.;:!?,\n]|\bbut\b")
+# Words that make a decision. Forms that only describe one ("accepting", "rejection", "accepted") do not count.
+_DECISION = re.compile(r"\b(accept|acceptable|unacceptable|reject|decline|refuse)\b")
+
+
+def is_negated(text: str, start: int) -> bool:
+    """True when one of the 3 words before position `start`, in the same clause, is a negation."""
+    clause = _CLAUSE_BREAK.split(text[:start])[-1]
+    return bool(_NEGATION.search(" ".join(clause.split()[-3:])))
+
+
+def parse_proposal(text: str) -> Tuple[int | None, str]:
+    """(tokens the proposer keeps, '') or (None, why the proposal is unclear).
+
+    'offer N' is the command (N = tokens the proposer keeps). "I keep 6" and "you get 4" are read for what they
+    say; a bare number counts as 'offer N'; a negated form ("I won't offer 3") does not count. Readings that
+    disagree, a number outside 0..10, or a reply that answers like a responder ('accept', 'reject') is unclear.
+    """
+    t = text.strip().lower().replace("’", "'")
+    if _DECISION.search(t):
+        return None, "it says 'accept' or 'reject', which is the Responder's move"
+    readings = [
+        int(m.group(1) or m.group(2)) for m in _KEEP_FORMS.finditer(t) if not is_negated(t, m.start())
+    ]
+    readings += [
+        TOKENS - int(m.group(1) or m.group(2)) for m in _GIVE_FORMS.finditer(t) if not is_negated(t, m.start())
+    ]
+    if not readings:
+        bare = re.fullmatch(r"\W*(-?\d+)\W*", t)
+        if bare:
+            readings = [int(bare.group(1))]
+    if not readings:
+        return None, "it names no number of tokens to keep"
+    if len(set(readings)) > 1:
+        return None, f"it can be read as keeping {' or '.join(str(r) for r in sorted(set(readings)))}"
+    keep = readings[0]
+    if not 0 <= keep <= TOKENS:
+        return None, f"{keep} is not between 0 and {TOKENS}"
+    return keep, ""
+
+
+def parse_response(text: str) -> str | None:
+    """'accept' or 'reject', the decision the reply makes; None when it makes none or both.
+
+    Every decision word counts ('accept', 'acceptable', 'reject', 'decline', 'refuse', 'unacceptable'), a
+    negated one as the other ("I do not accept this" rejects). Words that only describe a decision
+    ("Accepting would hand you the lead, so I reject") do not count.
+    """
+    t = text.lower().replace("’", "'")
+    readings = set()
+    for m in _DECISION.finditer(t):
+        choice = "accept" if m.group(1) in ("accept", "acceptable") else "reject"
+        if is_negated(t, m.start()):
+            choice = "reject" if choice == "accept" else "accept"
+        readings.add(choice)
+    return readings.pop() if len(readings) == 1 else None
+
+
 class BargainingActionHandler(ActionHandler):
     def handle_action(
         self, env: SocialDeductionGame, agent_name: str, action: AgentAction
     ) -> None:
-        if not isinstance(env, BargainingEnv):
+        if not isinstance(env, BargainingEnv) or agent_name not in env.awaiting():
             return
-        if action.action_type not in ["action", "speak"]:
-            return
-
-        agents = list(env.agents)
-        round_num = env.internal_state.get("round", 0)
-        proposer_idx = round_num % 2
-        proposer = agents[proposer_idx]
-        responder = agents[1 - proposer_idx]
-
+        replied = action.action_type in ["action", "speak"]  # anything else is a failed call
         if env.current_state == "Propose":
-            if agent_name != proposer:
-                return
-            # Parse "offer N"
-            arg = action.argument.strip().lower()
-            match = re.search(r"(\d+)", arg)
-            if match:
-                keep = int(match.group(1))
-                keep = max(0, min(10, keep))
-                env.internal_state["current_offer"] = keep
-
+            keep, why = parse_proposal(action.argument) if replied else (None, "the reply failed")
+            env.take_proposal(keep, why)
         elif env.current_state == "Respond":
-            if agent_name != responder:
-                return
-            arg = action.argument.strip().lower()
-            if "accept" in arg:
-                env.internal_state["current_response"] = "accept"
-            elif "reject" in arg:
-                env.internal_state["current_response"] = "reject"
+            env.take_response(parse_response(action.argument) if replied else None)
 
     def get_action_instruction(self, env: SocialDeductionGame, agent_name: str) -> str:
         if not isinstance(env, BargainingEnv):
             return ""
 
-        agents = list(env.agents)
         round_num = env.internal_state.get("round", 0)
         max_rounds = env._config.get("max_rounds", 10)
         scores = env.internal_state.get("scores", {})
-        proposer_idx = round_num % 2
-        proposer = agents[proposer_idx]
-        responder = agents[1 - proposer_idx]
+        proposer, responder = env.roles()
+        unclear = env.internal_state.get("unclear", 0)
 
         if env.current_state == "Propose":
             if agent_name == proposer:
-                return (
+                text = (
                     f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
                     f"You are the PROPOSER. You have 10 tokens to split. "
                     f"Choose 'offer N' where N is how many you keep (opponent gets 10-N). "
                     f"Example: 'offer 6' means you keep 6, opponent gets 4. "
-                    f"Higher total score wins."
+                    f"'offer N' always counts the tokens you keep, so 'offer 4 to you' is unclear. "
+                    f"An unclear proposal is announced and you are asked once more; if the second is also unclear, "
+                    f"your offer is drawn at random from 0 to {TOKENS}. Higher total score wins. Equal totals are a draw."
                 )
-            else:
-                return (
-                    f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
-                    f"{proposer} is the Proposer this round. Waiting for their offer."
-                )
+                if unclear:
+                    text += (
+                        f" Your last proposal was unclear ({env.internal_state.get('unclear_reason', '')}), so you "
+                        f"are asked once more. If this proposal is also unclear, your offer is drawn at random."
+                    )
+                return text
+            return (
+                f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
+                f"{proposer} is the Proposer this round. Waiting for their offer."
+            )
         elif env.current_state == "Respond":
             offer = env.internal_state.get("current_offer")
             if offer is None:
-                offer = 5
-            if agent_name == responder:
-                return (
-                    f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
-                    f"You are the RESPONDER. {proposer} offers to keep {offer} "
-                    f"(you would get {10 - offer}). "
-                    f"Choose 'accept' or 'reject'. If rejected, both get 0 this round. "
-                    f"Higher total score wins."
-                )
+                return ""
+            if env.internal_state.get("offer_drawn"):
+                offer_text = f"{proposer}'s offer was drawn at random: {proposer} keeps {offer}"
             else:
-                return (
+                offer_text = f"{proposer} offers to keep {offer}"
+            if agent_name == responder:
+                text = (
                     f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
-                    f"Waiting for {responder} to respond to your offer of keeping {offer}."
+                    f"You are the RESPONDER. {offer_text} "
+                    f"(you would get {TOKENS - offer}). "
+                    f"Choose 'accept' or 'reject'. If rejected, both get 0 this round. "
+                    f"Your reply is read for its decision; a reply that makes no decision, or both, is unclear: it is "
+                    f"announced and you are asked once more, and if the second is also unclear, accept or reject is "
+                    f"drawn at random, each equally likely. Higher total score wins. Equal totals are a draw."
                 )
+                if unclear:
+                    text += (
+                        " Your last response did not give one clear 'accept' or 'reject', so you are asked once more."
+                        " If this response is also unclear, your response is drawn at random."
+                    )
+                return text
+            return (
+                f"Round {round_num + 1}/{max_rounds}. Scores: {scores}. "
+                f"Waiting for {responder} to respond to your offer of keeping {offer}."
+            )
         return ""
 
 
@@ -182,91 +251,161 @@ class BargainingEnv(SocialDeductionGame):
             "scores": {name: 0 for name in self.agents},
             "current_offer": None,
             "current_response": None,
+            "unclear": 0,  # unclear replies of the player now due, in this phase of this round
+            "unclear_reason": "",
+            "offer_drawn": False,
+            "response_drawn": False,
             "game_over": False,
             "final_scores": {},
             "end_reason": "",
         }
+        # Offers and responses drawn for twice-unclear replies; seeded from the roster so replays agree.
+        self._fallback_rng = random.Random(f"{self._config.get('seed')}-fallback")
+        # The base reset built the first instructions before the scores existed ("Scores: {}"): rebuild them
+        for name in self.agents:
+            if name in obs and self.action_handler:
+                obs[name].action_instruction = self.action_handler.get_action_instruction(self, name)
         return obs
 
-    def _update_action_mask(self) -> None:
-        """Only the relevant player acts each phase."""
-        super()._update_action_mask()
+    def roles(self) -> Tuple[str, str]:
+        """(proposer, responder) of the current round: seat 0 proposes in odd rounds, seat 1 in even ones."""
         agents = list(self.agents)
-        round_num = self.internal_state.get("round", 0)
-        proposer_idx = round_num % 2
-        proposer = agents[proposer_idx]
-        responder = agents[1 - proposer_idx]
+        proposer_idx = self.internal_state.get("round", 0) % 2
+        return agents[proposer_idx], agents[1 - proposer_idx]
 
-        if self.current_state == "Propose":
-            for idx, name in enumerate(agents):
-                self.action_mask[idx] = name == proposer
-        elif self.current_state == "Respond":
-            for idx, name in enumerate(agents):
-                self.action_mask[idx] = name == responder
+    def awaiting(self) -> List[str]:
+        """The player whose reply the current phase still needs (none once the match is over)."""
+        if self.internal_state.get("game_over"):
+            return []
+        proposer, responder = self.roles()
+        if self.current_state == "Propose" and self.internal_state.get("current_offer") is None:
+            return [proposer]
+        if self.current_state == "Respond" and self.internal_state.get("current_response") is None:
+            return [responder]
+        return []
+
+    def _unclear(self, who: str, what: str, rule: str) -> bool:
+        """Count an unclear reply and announce it; True when it is the second one (the move is then drawn)."""
+        self.internal_state["unclear"] = self.internal_state.get("unclear", 0) + 1
+        if self.internal_state["unclear"] >= 2:
+            return True
+        round_num = self.internal_state.get("round", 0) + 1
+        self.recv_message(
+            "Environment",
+            SimpleMessage(message=f"[Round {round_num}] {who}'s {what} {rule}, so {who} is asked once more."),
+        )
+        return False
+
+    def take_proposal(self, keep: int | None, why: str) -> None:
+        """Hold a clear offer and announce it; ask an unclear (or failed) proposal once more, then draw the offer
+        uniformly from 0..10. Only the parsed offer is announced, never the proposal's text."""
+        proposer, responder = self.roles()
+        round_num = self.internal_state.get("round", 0) + 1
+        if keep is None:
+            self.internal_state["unclear_reason"] = why
+            if not self._unclear(proposer, "proposal", "was unclear"):
+                return
+            keep = self._fallback_rng.randint(0, TOKENS)
+            self.internal_state["offer_drawn"] = True
+            line = (
+                f"[Round {round_num}] {proposer}'s second proposal was also unclear, so {proposer}'s offer is drawn "
+                f"at random: {proposer} keeps {keep}, {responder} would get {TOKENS - keep}."
+            )
+        else:
+            line = f"[Round {round_num}] {proposer} offers to keep {keep}; {responder} would get {TOKENS - keep}."
+        self.internal_state["current_offer"] = keep
+        self.internal_state["unclear"] = 0
+        self.internal_state["unclear_reason"] = ""
+        self.recv_message("Environment", SimpleMessage(message=line))
+
+    def take_response(self, choice: str | None) -> None:
+        """Hold a clear response; ask an unclear (or failed) one once more, then draw accept or reject, 50/50."""
+        _, responder = self.roles()
+        if choice is None:
+            if not self._unclear(responder, "response", "did not give one clear 'accept' or 'reject'"):
+                return
+            choice = self._fallback_rng.choice(("accept", "reject"))
+            self.internal_state["response_drawn"] = True
+        self.internal_state["current_response"] = choice
+        self.internal_state["unclear"] = 0
+
+    def _update_action_mask(self) -> None:
+        """Only the player whose reply is due acts."""
+        super()._update_action_mask()
+        if self.current_state in ("Propose", "Respond"):
+            due = self.awaiting()
+            self.action_mask = [name in due for name in self.agents]
+
+    def _should_transition_state(self) -> bool:
+        # Stay in the phase while its player is asked once more; nothing follows the last round.
+        if self.internal_state.get("game_over"):
+            return False
+        if self.current_state == "Propose" and self.internal_state.get("current_offer") is None:
+            return False
+        if self.current_state == "Respond" and self.internal_state.get("unclear"):
+            return False
+        return super()._should_transition_state()
 
     def _check_eliminations(self) -> None:
-        if not self._should_transition_state():
+        if self.current_state != "Respond" or self.internal_state.get("current_response") is None:
             return
 
-        if self.current_state == "Respond":
-            offer = self.internal_state.get("current_offer")
-            response = self.internal_state.get("current_response")
-            # Default-and-continue: a missing offer is treated as a 50/50 split,
-            # a missing response is treated as a rejection. Either way the round
-            # always advances instead of stalling until the max-turn timeout.
-            if offer is None:
-                offer = 5
-            if response is None:
-                response = "reject"
+        agents = list(self.agents)
+        round_num = self.internal_state.get("round", 0)
+        proposer, responder = self.roles()
+        offer = self.internal_state["current_offer"]
+        response = self.internal_state["current_response"]
+        scores = self.internal_state["scores"]
+        if self.internal_state.get("offer_drawn"):
+            offered = f"{proposer}'s offer was drawn at random: keep {offer}"
+        else:
+            offered = f"{proposer} offered to keep {offer}"
+        if self.internal_state.get("response_drawn"):
+            decided = f"{responder}'s second response was also unclear, so it is drawn at random: {response.upper()}ED"
+        else:
+            decided = f"{responder} {response.upper()}ED"
 
-            agents = list(self.agents)
-            round_num = self.internal_state.get("round", 0)
-            proposer_idx = round_num % 2
-            proposer = agents[proposer_idx]
-            responder = agents[1 - proposer_idx]
-            scores = self.internal_state["scores"]
+        if response == "accept":
+            proposer_gain = offer
+            responder_gain = TOKENS - offer
+            scores[proposer] += proposer_gain
+            scores[responder] += responder_gain
+            msg = (
+                f"[Round {round_num + 1}] {offered}. {decided}. "
+                f"{proposer}+{proposer_gain}, {responder}+{responder_gain}. Scores: {scores}"
+            )
+        else:
+            msg = f"[Round {round_num + 1}] {offered}. {decided}. Both get 0. Scores: {scores}"
 
-            if response == "accept":
-                proposer_gain = offer
-                responder_gain = 10 - offer
-                scores[proposer] += proposer_gain
-                scores[responder] += responder_gain
-                msg = (
-                    f"[Round {round_num + 1}] {proposer} offered to keep {offer}. "
-                    f"{responder} ACCEPTED. {proposer}+{proposer_gain}, "
-                    f"{responder}+{responder_gain}. Scores: {scores}"
-                )
+        self.internal_state["round"] = round_num + 1
+        self.internal_state["current_offer"] = None
+        self.internal_state["current_response"] = None
+        self.internal_state["unclear"] = 0
+        self.internal_state["unclear_reason"] = ""
+        self.internal_state["offer_drawn"] = False
+        self.internal_state["response_drawn"] = False
+
+        self.recv_message("Environment", SimpleMessage(message=msg))
+
+        max_rounds = self._config.get("max_rounds", 10)
+        if self.internal_state["round"] >= max_rounds:
+            s1, s2 = scores[agents[0]], scores[agents[1]]
+            if s1 > s2:
+                final = {agents[0]: 1.0, agents[1]: -1.0}
+                reason = f"Game over. {agents[0]} wins! Final: {scores}"
+            elif s2 > s1:
+                final = {agents[0]: -1.0, agents[1]: 1.0}
+                reason = f"Game over. {agents[1]} wins! Final: {scores}"
             else:
-                msg = (
-                    f"[Round {round_num + 1}] {proposer} offered to keep {offer}. "
-                    f"{responder} REJECTED. Both get 0. Scores: {scores}"
-                )
+                final = {agents[0]: 0.0, agents[1]: 0.0}
+                reason = f"Game over. Tie! Final: {scores}"
 
-            self.internal_state["round"] = round_num + 1
-            self.internal_state["current_offer"] = None
-            self.internal_state["current_response"] = None
-
-            self.recv_message("Environment", SimpleMessage(message=msg))
-
-            max_rounds = self._config.get("max_rounds", 10)
-            if self.internal_state["round"] >= max_rounds:
-                s1, s2 = scores[agents[0]], scores[agents[1]]
-                if s1 > s2:
-                    final = {agents[0]: 1.0, agents[1]: -1.0}
-                    reason = f"Game over. {agents[0]} wins! Final: {scores}"
-                elif s2 > s1:
-                    final = {agents[0]: -1.0, agents[1]: 1.0}
-                    reason = f"Game over. {agents[1]} wins! Final: {scores}"
-                else:
-                    final = {agents[0]: 0.0, agents[1]: 0.0}
-                    reason = f"Game over. Tie! Final: {scores}"
-
-                self.internal_state["game_over"] = True
-                self.internal_state["final_scores"] = final
-                self.internal_state["end_reason"] = reason
-                self.recv_message(
-                    "Environment", SimpleMessage(message=f"[Game] {reason}")
-                )
+            self.internal_state["game_over"] = True
+            self.internal_state["final_scores"] = final
+            self.internal_state["end_reason"] = reason
+            self.recv_message(
+                "Environment", SimpleMessage(message=f"[Game] {reason}")
+            )
 
 
 # ============================================================================
@@ -300,7 +439,8 @@ def create_environment(
         env_profile=env_profile,
         config=config,
         model_name=model_name,
-        evaluators=[BargainingEvaluator(max_turn_number=25)],
+        # Safety cap only: each round takes two steps, or up to four when replies are asked again.
+        evaluators=[BargainingEvaluator(max_turn_number=4 * config.get("max_rounds", 10))],
         terminal_evaluators=[],
         hide_unknown=True,
     )

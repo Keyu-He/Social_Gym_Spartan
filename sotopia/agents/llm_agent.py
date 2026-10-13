@@ -5,6 +5,9 @@ from typing import Any, cast
 from sotopia.agents import BaseAgent
 from sotopia.database import AgentProfile
 from sotopia.generation_utils.generate import (
+    GENERATION_OPTIONS,
+    LAST_COMPLETION_METADATA,
+    LAST_REASONING,
     agenerate_action,
     agenerate_goal,
     agenerate_script,
@@ -41,6 +44,7 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
         self.script_like = script_like
         self.strict_action_constraint = strict_action_constraint
         self.custom_template = custom_template
+        self.generation_options: dict[str, Any] = {}
         self.generation_history: list[dict[str, Any]] = []
 
     @property
@@ -80,23 +84,33 @@ class LLMAgent(BaseAgent[Observation, AgentAction]):
                     custom_template, action_instructions=obs.action_instruction
                 )
 
-            action, prompt, raw_response = await agenerate_action(
-                self.model_name,
-                history="\n".join(f"{y.to_natural_language()}" for x, y in self.inbox),
-                turn_number=obs.turn_number,
-                action_types=obs.available_actions,
-                agent=self.agent_name,
-                goal=self.goal,
-                script_like=self.script_like,
-                strict_action_constraint=self.strict_action_constraint,
-                custom_template=custom_template,
-                return_prompt_and_response=True,
-            )
+            LAST_REASONING.set(None)
+            LAST_COMPLETION_METADATA.set(None)
+            options_token = GENERATION_OPTIONS.set(self.generation_options)
+            try:
+                action, prompt, raw_response = await agenerate_action(
+                    self.model_name,
+                    history="\n".join(
+                        f"{y.to_natural_language()}" for x, y in self.inbox
+                    ),
+                    turn_number=obs.turn_number,
+                    action_types=obs.available_actions,
+                    agent=self.agent_name,
+                    goal=self.goal,
+                    script_like=self.script_like,
+                    strict_action_constraint=self.strict_action_constraint,
+                    custom_template=custom_template,
+                    return_prompt_and_response=True,
+                )
+            finally:
+                GENERATION_OPTIONS.reset(options_token)
             self.generation_history.append(
                 {
                     "turn_number": obs.turn_number,
                     "prompt": prompt,
                     "response": raw_response,
+                    "reasoning": LAST_REASONING.get(),
+                    "generation": LAST_COMPLETION_METADATA.get(),
                     "parsed_action": action.model_dump(),
                     "agent_name": self.agent_name,
                 }

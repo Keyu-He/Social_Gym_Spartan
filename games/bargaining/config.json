@@ -1,8 +1,8 @@
 {
     "scenario": "Bargaining",
-    "description": "Two players play the Bargaining Game (iterated ultimatum) for exactly 10 rounds. You cannot speak to the other player. Each round, one player is the Proposer and the other is the Responder (roles alternate each round). The Proposer has 10 tokens to split: they choose 'offer N' where N is how many tokens the Proposer keeps (Responder gets 10-N). The Responder chooses 'accept' or 'reject'. Accept: both get their share. Reject: both get 0 for that round. GOAL: Maximize your own total tokens over the 10 rounds. The player with the higher total wins. Players: {agent_names}.",
+    "description": "Two players play the Bargaining Game (iterated ultimatum) for exactly 10 rounds. You cannot speak to the other player. Each round, one player is the Proposer and the other is the Responder (roles alternate each round). The Proposer has 10 tokens to split: they choose 'offer N' where N is how many tokens the Proposer keeps (Responder gets 10-N). The Responder chooses 'accept' or 'reject'. Accept: both get their share. Reject: both get 0 for that round. 'offer N' always counts the tokens the Proposer keeps, so a proposal that says the N tokens go to the other player ('offer 4 to you') contradicts itself and is unclear. The other player sees only the parsed offer or decision, never the text of a reply. Unclear replies: a proposal that does not give one valid 'offer N' (N a whole number from 0 to 10), or that says 'accept' or 'reject' (the Responder's words), is unclear, and so is a response that does not make one clear decision, 'accept' or 'reject' (a negated 'not accept' counts as 'reject'; words that only describe a decision, such as 'accepting', do not count). An unclear or failed reply is announced to both players and that player is asked once more; if the second reply is also unclear, the offer (the tokens the Proposer keeps) is drawn at random from 0 to 10, each number equally likely, or the response is drawn as accept or reject, each equally likely. GOAL: Maximize your own total tokens over the 10 rounds. The player with the higher total wins. Equal totals are a draw. Players: {agent_names}.",
     "role_goals": {
-        "Player": "Maximize your own total tokens over 10 rounds. Higher total wins."
+        "Player": "Maximize your own total tokens over 10 rounds. Higher total wins. Equal totals are a draw."
     },
     "role_secrets": {},
     "max_rounds": 10,
@@ -13,7 +13,7 @@
         "Respond": "Propose"
     },
     "state_properties": {
-        "Propose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"},
-        "Respond": {"actions": ["action"], "action_order": "simultaneous", "visibility": "public"}
+        "Propose": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"},
+        "Respond": {"actions": ["action"], "action_order": "simultaneous", "visibility": "private"}
     }
 }

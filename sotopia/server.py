@@ -261,6 +261,11 @@ async def arun_one_episode(
                                 "prompt": entry.get("prompt"),
                                 "response": entry.get("response"),
                             }
+                            # Only thinking models produce this; other logs stay unchanged.
+                            if entry.get("reasoning"):
+                                clean_entry["reasoning"] = entry["reasoning"]
+                            if entry.get("generation") is not None:
+                                clean_entry["generation"] = entry["generation"]
                             turns_list.append(clean_entry)
 
                 # Sort by turn number

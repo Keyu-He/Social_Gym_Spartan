@@ -11,7 +11,7 @@ The contribution claimed by this paper is limited to:
 
 - the **game-engine layer** that extends Sotopia's abstractions to support
   finite-state-machine games with role-conditioned visibility,
-- the **21 game implementations** under `games/`,
+- the **22 game implementations** under `games/`,
 - the **Elo tournament infrastructure** and the **SPaRTan
   play-reflect-transfer pipeline** under `experiments/`,
 - and the experimental data, reflection playbooks, and analyses reported in

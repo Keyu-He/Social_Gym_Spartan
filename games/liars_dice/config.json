@@ -1,28 +1,46 @@
 {
-  "scenario": "Liar's Dice",
-  "description": "This game is called Liar's Dice. Each player has hidden dice (rolled fresh each round). Players take turns making bids about the total count of a face value across ALL players' dice. Each bid must be higher than the previous (higher quantity, or same quantity with higher face value). Instead of bidding higher, you can call 'liar' to challenge the current bid.\n\nRESOLUTION: When 'liar' is called, all dice are revealed. If the actual count of the bid face is LESS than the bid quantity, the bidder was lying and loses a die. If the actual count MEETS or EXCEEDS the bid, the caller was wrong and loses a die. A new round begins with fresh dice rolls.\n\nELIMINATION: Lose all your dice and you are eliminated. Last player standing wins.\n\nCOMMANDS:\n- 'bid QUANTITY FACE' to make a bid (e.g., 'bid 3 4' means 'at least three 4s among all dice').\n- 'liar' to challenge the current bid.\n\nPlayers: {agent_names}.",
-  "role_goals": {
-    "Player": "Be the last player with dice remaining. Bluff strategically and call liars wisely."
-  },
-  "role_secrets": {
-    "Player": "Your dice are revealed privately each round."
-  },
-  "starting_dice": 5,
-  "initial_state": "Bidding",
-  "state_transition": {
-    "Bidding": "Bidding"
-  },
-  "state_properties": {
-    "Bidding": {
-      "actions": ["action"],
-      "action_order": "round-robin",
-      "visibility": "public"
-    }
-  },
-  "end_conditions": [],
-  "agents": [
-    {"name": "Alice", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
-    {"name": "Bob", "role": "Player", "team": "Players", "agent_model": "gpt-4o"},
-    {"name": "Charlie", "role": "Player", "team": "Players", "agent_model": "gpt-4o"}
-  ]
+    "scenario": "Liar's Dice",
+    "description": "This game is called Liar's Dice. Each player has hidden dice (rolled fresh each round). Players take turns making bids about the total count of a face value across ALL players' dice. Each bid must be higher than the previous (higher quantity, or same quantity with higher face value). Instead of bidding higher, you can call 'liar' to challenge the current bid.\n\nILLEGAL MOVES: On your turn you must either raise the bid or call 'liar'. Only the move your reply commits to counts: a move you mention while saying you will not make it, might make it, or will make it on a later turn does not count ('I won't call liar; bid 4 5' is a bid). A bid that is not higher than the current bid, a malformed command, calling 'liar' when there is no bid on the table, a reply that commits to two different moves (say, a bid and 'liar'), or making no move at all is an illegal move: it costs you one die and ends the round at once (no dice are revealed), everyone re-rolls, and you open the next round (the next player in seat order opens if you were eliminated).\n\nRESOLUTION: When 'liar' is called, all dice are revealed. If the actual count of the bid face is LESS than the bid quantity, the bidder was lying and loses a die. If the actual count MEETS or EXCEEDS the bid, the caller was wrong and loses a die. A new round begins with fresh dice rolls, and the player who lost the die opens it; if that player was eliminated, the next player in seat order opens.\n\nELIMINATION: Lose all your dice and you are eliminated. Last player standing wins.\n\nCOMMANDS:\n- 'bid QUANTITY FACE' to make a bid (e.g., 'bid 3 4' means 'at least three 4s among all dice'; 'bid three fours' reads the same).\n- 'liar' to challenge the current bid ('dudo', 'challenge' and 'I call' mean the same).\n\nPlayers: {agent_names}.",
+    "role_goals": {
+        "Player": "Be the last player with dice remaining. Bluff strategically and call liars wisely."
+    },
+    "role_secrets": {
+        "Player": "Your dice are revealed privately each round."
+    },
+    "starting_dice": 5,
+    "max_turns": 100,
+    "initial_state": "Bidding",
+    "state_transition": {
+        "Bidding": "Bidding"
+    },
+    "state_properties": {
+        "Bidding": {
+            "actions": [
+                "action"
+            ],
+            "action_order": "round-robin",
+            "visibility": "public"
+        }
+    },
+    "end_conditions": [],
+    "agents": [
+        {
+            "name": "Alice",
+            "role": "Player",
+            "team": "Players",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Bob",
+            "role": "Player",
+            "team": "Players",
+            "agent_model": "gpt-4o"
+        },
+        {
+            "name": "Charlie",
+            "role": "Player",
+            "team": "Players",
+            "agent_model": "gpt-4o"
+        }
+    ]
 }

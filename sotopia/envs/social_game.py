@@ -8,7 +8,7 @@ import random
 from collections import defaultdict
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Literal, cast
+from typing import Tuple, Any, Dict, List, Literal, cast
 
 from sotopia.envs.parallel import ParallelSotopiaEnv
 from sotopia.envs.evaluators import Evaluator, unweighted_aggregate_evaluate
@@ -113,7 +113,7 @@ class SocialGame(ParallelSotopiaEnv, ABC):
             agent: {
                 "comments": evaluator_response.comments or "",
                 "complete_rating": (
-                    evaluator_response.rewards.get(f"agent_{i+1}", (0, {}))[0]
+                    evaluator_response.rewards.get(f"agent_{i + 1}", (0, {}))[0]
                     if evaluator_response.rewards
                     else 0
                 ),
@@ -170,6 +170,63 @@ class ActionHandler(ABC):
             A string containing instructions, or empty string.
         """
         return ""
+
+
+def rank_split_rewards(scores: Dict[str, float]) -> Dict[str, float]:
+    """Top half of the table wins (+1), bottom half loses (-1).
+
+    Players on the same score share one fate: a score group inside the top
+    half wins, one inside the bottom half loses, and one that straddles a
+    boundary (or fills the middle seat of an odd table) draws (0). A plain
+    stable sort would instead let seating order pick which of two equals wins.
+    """
+    n = len(scores)
+    k = n // 2
+    ordered = sorted(scores, key=lambda name: scores[name], reverse=True)
+    rewards: Dict[str, float] = {}
+    start = 0
+    while start < n:
+        end = start
+        while end + 1 < n and scores[ordered[end + 1]] == scores[ordered[start]]:
+            end += 1
+        if end < k:
+            value = 1.0
+        elif start >= n - k:
+            value = -1.0
+        else:
+            value = 0.0
+        for name in ordered[start : end + 1]:
+            rewards[name] = value
+        start = end + 1
+    return rewards
+
+
+def graded_rank_rewards(
+    scores: Dict[str, float], values: Tuple[float, ...] | None = None
+) -> Dict[str, float]:
+    """Every finishing place gets its own reward, evenly spaced from +1 down to -1.
+
+    Four players: 1st +1, 2nd +1/3, 3rd -1/3, 4th -1 (a step of 2/3 between places).
+    Unlike ``rank_split_rewards`` this orders every pair of players, so a 4-player
+    game yields six decisive pairwise comparisons for the Bradley-Terry fit instead of
+    four plus two ties. Players on the same score share the mean of the values of the
+    places they span (two tied for 2nd/3rd both get 0). ``values`` overrides the ladder.
+    """
+    n = len(scores)
+    if values is None or len(values) != n:
+        values = tuple(1.0 - 2.0 * i / (n - 1) for i in range(n)) if n > 1 else (0.0,)
+    ordered = sorted(scores, key=lambda name: scores[name], reverse=True)
+    rewards: Dict[str, float] = {}
+    start = 0
+    while start < n:
+        end = start
+        while end + 1 < n and scores[ordered[end + 1]] == scores[ordered[start]]:
+            end += 1
+        value = round(sum(values[start : end + 1]) / (end - start + 1), 12)
+        for name in ordered[start : end + 1]:
+            rewards[name] = value + 0.0  # -0.0 -> 0.0
+        start = end + 1
+    return rewards
 
 
 class SocialDeductionGame(SocialGame):
@@ -229,6 +286,87 @@ class SocialDeductionGame(SocialGame):
             team = agent_entry.get("team")
             if role and team:
                 self.role_to_team.setdefault(role, team)
+
+        # One draw stream per episode, seeded from the roster so replays agree.
+        self._tie_rng = random.Random(f"{self._config.get('seed')}-tie")
+
+    def break_tie(self, candidates: List[str]) -> str:
+        """Pick one of several tied candidates by a seeded random draw.
+
+        Seating order must never decide a game, and taking the first name
+        that reaches the top vote count does exactly that. Callers announce
+        the draw so the transcript shows the tie.
+        """
+        if not hasattr(self, "_tie_rng"):
+            self._tie_rng = random.Random(f"{self._config.get('seed')}-tie")
+        return self._tie_rng.choice(sorted(candidates))
+
+    # ------------------------------------------------------------------ round-robin turns
+    # A round-robin state gives one turn to each agent who is eligible (alive, in an acting role) when the
+    # state begins, in seat order. The engine keeps that membership for the whole state: an agent who becomes
+    # eligible in the middle (Survivor's jurors after the pleas) gets no turn in it and does not lengthen it.
+    # If a member stops being eligible in the middle (eliminated), the seat order is kept: the next turn goes
+    # to the first remaining member after the agent who just acted, and the state ends once every remaining
+    # member has had its turn. A game may place the pointer itself (Liar's Dice picks who opens the next
+    # bidding round); the setter below records that, and the engine then follows the game's choice.
+
+    @property
+    def _round_robin_idx(self) -> int:
+        return int(self.__dict__.get("_rr_pointer", 0))
+
+    @_round_robin_idx.setter
+    def _round_robin_idx(self, value: int) -> None:
+        self.__dict__["_rr_pointer"] = value
+        self.__dict__["_rr_pointer_placed"] = True
+
+    def _eligible_indices(self) -> List[int]:
+        """Seats of the agents allowed to act in the current state (alive, and in an acting role if the state
+        names any)."""
+        acting_roles = (
+            self._config.get("state_properties", {})
+            .get(self.current_state, {})
+            .get("acting_roles", [])
+        )
+        return [
+            idx
+            for idx, agent_name in enumerate(self.agents)
+            if self.agent_alive.get(agent_name, False)
+            and (not acting_roles or self.agent_to_role.get(agent_name, "") in acting_roles)
+        ]
+
+    def _round_robin_turn(self) -> Dict[str, Any] | None:
+        """This round-robin state's bookkeeping, or None when the state has just begun (no turn taken yet)."""
+        turn = self.__dict__.get("_rr_turn")
+        turns = getattr(self, "_state_turn_count", {}).get(self.current_state, 0)
+        if not turn or turn["state"] != self.current_state or turns == 0:
+            return None
+        return turn
+
+    def _round_robin_live(self, eligible: List[int]) -> List[int]:
+        """The members of this round-robin turn who can still act."""
+        turn = self._round_robin_turn()
+        return eligible if turn is None else [i for i in eligible if i in turn["members"]]
+
+    def _resync_round_robin(self) -> None:
+        """Keep the seat order when a member left this round-robin state since the last turn and the game did
+        not place the pointer itself: point at the first remaining member after the one who just acted, and
+        set the turn count so the state ends once every remaining member has had its turn."""
+        state_props = self._config.get("state_properties", {}).get(self.current_state, {})
+        if state_props.get("action_order", self.action_order) != "round-robin":
+            return
+        turn = self._round_robin_turn()
+        if turn is None or "last" not in turn or self.__dict__.get("_rr_pointer_placed"):
+            return
+        live = self._round_robin_live(self._eligible_indices())
+        if live == turn["live"]:
+            return
+        remaining = [i for i in live if i not in turn["acted"]]
+        if remaining:
+            n = len(self.agents)
+            nxt = min(remaining, key=lambda i: (i - turn["last"] - 1) % n)
+            self.__dict__["_rr_pointer"] = live.index(nxt)
+        self._state_turn_count[self.current_state] = len(live) - len(remaining)
+        turn["live"] = list(live)
 
     async def astep(
         self, actions: Dict[str, AgentAction] | Dict[str, Dict[str, int | str]]
@@ -312,6 +450,9 @@ class SocialDeductionGame(SocialGame):
         self.current_state = self._config.get("initial_state", "Unknown")
         self.internal_state = {}
         self._state_turn_count = {self.current_state: 0}
+        # A reused env starts the round-robin afresh: seat 0 opens, as in a new env.
+        for key in ("_rr_pointer", "_rr_pointer_placed", "_rr_turn"):
+            self.__dict__.pop(key, None)
 
         # Send initial system message
         initial_msg_content = f"[Game] State: {self.current_state}. The game begins!"
@@ -349,6 +490,7 @@ class SocialDeductionGame(SocialGame):
 
     def state_transition(self) -> None:
         """Handle state transitions."""
+        self._resync_round_robin()
         should_transition = self._should_transition_state()
         logger.debug(
             f"Turn {self.turn_number}: state={self.current_state}, should_transition={should_transition}, state_turn_count={getattr(self, '_state_turn_count', {})}"
@@ -417,13 +559,22 @@ class SocialDeductionGame(SocialGame):
             return
 
         if action_order == "round-robin":
-            # Cycle through eligible agents only
-            if not hasattr(self, "_round_robin_idx"):
-                self._round_robin_idx = 0
-            # Get next eligible agent
-            acting_idx = eligible_indices[self._round_robin_idx % len(eligible_indices)]
+            # Cycle through this state's members who are still eligible (see the round-robin notes above)
+            turn = self._round_robin_turn()
+            if turn is None:  # the state begins: its members are the agents eligible now
+                turn = {"state": self.current_state, "members": set(eligible_indices), "acted": set()}
+                self.__dict__["_rr_turn"] = turn
+            live = [i for i in eligible_indices if i in turn["members"]]
+            if not live:
+                return
+            acting_idx = live[self._round_robin_idx % len(live)]
             self.action_mask[acting_idx] = True
-            self._round_robin_idx += 1
+            # The engine's own step is not a placement by the game.
+            self.__dict__["_rr_pointer"] = self._round_robin_idx + 1
+            self.__dict__["_rr_pointer_placed"] = False
+            turn["acted"].add(acting_idx)
+            turn["last"] = acting_idx
+            turn["live"] = list(live)
         elif action_order == "random":
             # Pick random eligible agent
             acting_idx = random.choice(eligible_indices)
@@ -455,6 +606,9 @@ class SocialDeductionGame(SocialGame):
         else:
             # All alive agents act
             num_acting_agents = sum(1 for alive in self.agent_alive.values() if alive)
+        if action_order == "round-robin":
+            # Only the state's members who can still act (an agent who became eligible mid-state does not count)
+            num_acting_agents = len(self._round_robin_live(self._eligible_indices()))
 
         # Transition logic based on action order
         if action_order == "simultaneous":
@@ -483,7 +637,7 @@ class SocialDeductionGame(SocialGame):
                 "Environment",
                 SimpleMessage(message=f"[Game] Entering state: {self.current_state}"),
             )
-            logger.info(f"{'-'* 50}\nTurn to {self.current_state}\n{'-'* 50}")
+            logger.info(f"{'-' * 50}\nTurn to {self.current_state}\n{'-' * 50}")
 
     def _build_observations(self) -> Dict[str, Observation]:
         """Build observations for each agent based on visibility rules."""
