@@ -1,4 +1,5 @@
 import csv
+import functools
 import glob
 import json
 import math
@@ -11,7 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 
-from experiments.utils import load_game_config
+from experiments.utils import load_game_config, rated_logs, unrecovered_request_failures
 
 # ---------------------------------------------------------------------------
 # Rating constants
@@ -27,6 +28,10 @@ COOPERATIVE_GAMES = {"battle_of_the_sexes", "stag_hunt", "public_goods", "centip
 # Canonical model name mapping: raw model string → display name.
 # Handles endpoint changes, naming inconsistencies, etc.
 MODEL_NAME_MAP = {
+    # Gemma 3 12B / 4B, Qwen 3 1.7B
+    "google/gemma-3-12b-it": "Gemma3-12B",
+    "google/gemma-3-4b-it": "Gemma3-4B",
+    "Qwen/Qwen3-1.7B": "Qwen3-1.7B",
     # OpenAI
     "gpt-4o": "gpt-4o",
     "gpt-4o-mini": "gpt-4o-mini",
@@ -56,53 +61,114 @@ def normalize_model_name(raw: str) -> str:
     return name
 
 
+EpisodeCounts = tuple[Dict[tuple, int], Dict[tuple, int]]  # one episode's (wins, ties)
+
+# Resampling unit of the bootstrap behind every 95% interval (bootstrap_mle_elo): "pair" draws battles, the
+# leaderboard's default; "episode" draws whole episodes.
+BOOTSTRAP_UNITS = ("pair", "episode")
+DEFAULT_BOOTSTRAP = "pair"
+
+
+def _pair_draws(
+    win_counts: Dict[tuple, int], tie_counts: Dict[tuple, int], n_bootstrap: int, seed: int
+) -> Iterable[EpisodeCounts]:
+    """FastChat's compute_bootstrap_bt resample. Each draw takes N battles with replacement, N being the number
+    of battles in win_counts and tie_counts together, as one multinomial over all their cells: a tied pair is
+    one battle, drawn like a decided one. Cells are taken in sorted order, so the draws do not depend on the
+    order in which the counts were built."""
+    win_keys, tie_keys = sorted(win_counts), sorted(tie_counts)
+    counts = np.array([win_counts[k] for k in win_keys] + [tie_counts[k] for k in tie_keys], dtype=float)
+    probs = counts / counts.sum()
+    total = int(counts.sum())
+    rng = np.random.default_rng(seed)
+    for _ in range(n_bootstrap):
+        draw = rng.multinomial(total, probs)
+        yield (
+            {k: int(v) for k, v in zip(win_keys, draw[: len(win_keys)]) if v > 0},
+            {k: int(v) for k, v in zip(tie_keys, draw[len(win_keys) :]) if v > 0},
+        )
+
+
+class _EpisodeCountTable:
+    """Per-episode win and tie counts as matrices, so a resample of episodes aggregates in one product."""
+
+    def __init__(self, episodes: list[EpisodeCounts]) -> None:
+        self.win_keys = sorted({k for w, _ in episodes for k in w})
+        self.tie_keys = sorted({k for _, t in episodes for k in t})
+        wi = {k: i for i, k in enumerate(self.win_keys)}
+        ti = {k: i for i, k in enumerate(self.tie_keys)}
+        self.wins = np.zeros((len(episodes), len(self.win_keys)))
+        self.ties = np.zeros((len(episodes), len(self.tie_keys)))
+        for e, (w, t) in enumerate(episodes):
+            for k, c in w.items():
+                self.wins[e, wi[k]] += c
+            for k, c in t.items():
+                self.ties[e, ti[k]] += c
+
+    def aggregate(self, multiplicity: np.ndarray) -> EpisodeCounts:
+        """Counts of a resample in which episode e appears multiplicity[e] times."""
+        w = multiplicity @ self.wins if self.win_keys else np.zeros(0)
+        t = multiplicity @ self.ties if self.tie_keys else np.zeros(0)
+        return (
+            {k: int(round(v)) for k, v in zip(self.win_keys, w) if v > 0},
+            {k: int(round(v)) for k, v in zip(self.tie_keys, t) if v > 0},
+        )
+
+
+def _episode_multiplicities(n_episodes: int, n_bootstrap: int, seed: int) -> Iterable[np.ndarray]:
+    """For each bootstrap draw, how often each episode appears in a resample of n_episodes episodes
+    drawn with replacement. The same seed gives the same draws, so fits that share a seed (the overall
+    and the alt/main fits in process_logs_bt) see the same resampled episodes."""
+    rng = np.random.default_rng(seed)
+    for _ in range(n_bootstrap):
+        yield np.bincount(rng.integers(0, n_episodes, n_episodes), minlength=n_episodes).astype(float)
+
+
 def bootstrap_mle_elo(
     win_counts: Dict[tuple, int],
     tie_counts: Dict[tuple, int],
     models: list[str],
     n_bootstrap: int = 1000,
     seed: int = 42,
+    bootstrap: str = DEFAULT_BOOTSTRAP,
+    episodes: Optional[list[EpisodeCounts]] = None,
     **mle_kwargs,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bootstrap CI for the BT MLE via multinomial resampling on aggregated counts.
+    """Bootstrap 95% CI for the BT MLE. Returns (point, ci_lo, ci_hi) aligned with `models`.
 
-    Returns (point, ci_lo, ci_hi) arrays aligned with `models`. Mirrors the
-    `compute_bootstrap_bt` approach in FastChat: each iteration draws N total
-    battles with replacement (multinomial) from the empirical distribution
-    over unique (winner, loser) and (tied-pair) cells, refits BT.
+    Each of the `n_bootstrap` draws resamples the battles and refits `compute_mle_elo`; the interval is the
+    2.5th to 97.5th percentile of the refits. A tie counts as one half-game in every refit, as in the point fit.
+
+    bootstrap="pair" (default) is FastChat's compute_bootstrap_bt: a multinomial draw of as many battles as the
+    data has over the win and tie cells together (`_pair_draws`).
+    bootstrap="episode" resamples whole episodes with replacement, so all the pairs of one episode are drawn
+    together. It needs `episodes`, one (wins, ties) pair per episode summing to win_counts / tie_counts
+    (`_episode_pair_counts` builds them); the pair mode does not use them. Fits that share a seed draw the
+    same episodes.
     """
+    if bootstrap not in BOOTSTRAP_UNITS:
+        raise ValueError(f"unknown bootstrap unit {bootstrap!r}; expected one of {BOOTSTRAP_UNITS}")
+    if bootstrap == "episode" and episodes is None:
+        raise TypeError(
+            "the episode bootstrap needs per-episode counts (episodes=[(wins, ties), ...])"
+        )
     point = compute_mle_elo(win_counts, tie_counts, models, **mle_kwargs)
-    if not win_counts and not tie_counts:
+    n_battles = sum(win_counts.values()) + sum(tie_counts.values())
+    if n_battles == 0 or (bootstrap == "episode" and not episodes):
         return point, point.copy(), point.copy()
 
-    rng = np.random.default_rng(seed)
-    n_models = len(models)
-    samples = np.zeros((n_bootstrap, n_models))
-
-    win_keys = list(win_counts.keys())
-    tie_keys = list(tie_counts.keys())
-    counts = np.array(
-        [win_counts[k] for k in win_keys] + [tie_counts[k] for k in tie_keys],
-        dtype=float,
-    )
-    total = int(counts.sum())
-    if total == 0:
-        return point, point.copy(), point.copy()
-    probs = counts / counts.sum()
-    n_win = len(win_keys)
-
-    for b in range(n_bootstrap):
-        draw = rng.multinomial(total, probs)
-        wc = {k: int(v) for k, v in zip(win_keys, draw[:n_win]) if v > 0}
-        tc = {k: int(v) for k, v in zip(tie_keys, draw[n_win:]) if v > 0}
+    if bootstrap == "pair":
+        draws = _pair_draws(win_counts, tie_counts, n_bootstrap, seed)
+    else:
+        table = _EpisodeCountTable(episodes)
+        draws = (table.aggregate(m) for m in _episode_multiplicities(len(episodes), n_bootstrap, seed))
+    samples = np.zeros((n_bootstrap, len(models)))
+    for b, (wc, tc) in enumerate(draws):
         try:
             samples[b] = compute_mle_elo(wc, tc, models, **mle_kwargs)
         except Exception:
             samples[b] = point  # fallback if a draw produces a degenerate fit
-
-    ci_lo = np.percentile(samples, 2.5, axis=0)
-    ci_hi = np.percentile(samples, 97.5, axis=0)
-    return point, ci_lo, ci_hi
+    return point, np.percentile(samples, 2.5, axis=0), np.percentile(samples, 97.5, axis=0)
 
 
 def compute_mle_elo(
@@ -120,8 +186,9 @@ def compute_mle_elo(
       - feature matrix X has +log(base) in the model_a column and -log(base)
         in the model_b column for each battle.
       - target Y = 1 if model_a won, 0 if model_b won.
-      - ties are duplicated as (a-wins=1, b-wins=0) — both rows are added so
-        a tie contributes one win and one loss to each side.
+      - a tie is one half-game each way: it adds an (a-wins=1) row and an
+        (a-wins=0) row with weight 0.5 each, so a tie weighs as much as one
+        decisive result (weight 1) and counts as half a win for each side.
       - sklearn LogisticRegression(fit_intercept=False, penalty='l2') fits
         coefficients beta_i; the resulting Elo is `scale * beta_i + init_rating`.
       - L2 strength: C=0.1 by default. Stronger than sklearn's C=1.0 default
@@ -157,9 +224,9 @@ def compute_mle_elo(
         if c <= 0 or a_raw not in idx or b_raw not in idx:
             continue
         a, b = sorted((a_raw, b_raw))
-        # Duplicate: one row counts as a-wins, one as b-wins.
-        rows.append((idx[a], idx[b], 1.0, float(c)))
-        rows.append((idx[a], idx[b], 0.0, float(c)))
+        # A tie is half a win for each side: one a-wins row and one b-wins row, half weight each.
+        rows.append((idx[a], idx[b], 1.0, 0.5 * float(c)))
+        rows.append((idx[a], idx[b], 0.0, 0.5 * float(c)))
 
     if not rows:
         return np.full(p, init_rating)
@@ -237,14 +304,28 @@ class ParsedEpisode:
     unique_models: set[str]  # distinct models in this episode
 
 
-def _parse_episode(filepath: str) -> Optional[ParsedEpisode]:
+def _parse_episode(
+    filepath: str, skipped: Optional[list[str]] = None
+) -> Optional[ParsedEpisode]:
     """Load an episode log and return its data in a form both rating methods
     can iterate over. Returns None for malformed logs (caller should skip).
+
+    Also returns None for an episode in which a model call failed at the
+    request level and was not recovered by the retries (a connection error,
+    timeout or server error played as a 'none' move): its outcome is not the
+    models' play. Such files are appended to `skipped` when it is given; the
+    tournament runner replays their rosters on resume. A model's own
+    malformed reply does not cause a skip.
     """
     try:
         with open(filepath, "r") as f:
             data = json.load(f)
     except Exception:
+        return None
+
+    if unrecovered_request_failures(data):
+        if skipped is not None:
+            skipped.append(filepath)
         return None
 
     raw_mapping = data.get("model_mapping", {})
@@ -324,17 +405,22 @@ def _build_stats(
     elo: Dict[str, float] | np.ndarray,
     elo_alt: Dict[str, float] | np.ndarray,
     elo_main: Dict[str, float] | np.ndarray,
-    wins: Dict[str, int],
+    wins: Dict[str, float],
     total_pairwise: Dict[str, int],
     episodes_played: Dict[str, int],
     ci_lo: Optional[np.ndarray] = None,
     ci_hi: Optional[np.ndarray] = None,
+    role_ci: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> list[dict[str, Any]]:
     """Build the per-model stats list shared by both rating methods.
 
     `models` defines the order used to interpret ndarray-typed ratings.
-    Output is sorted by descending overall ELO. If `ci_lo`/`ci_hi` are
+    Output is sorted by descending overall ELO. win_rate is wins / pairwise comparisons, where a tie
+    counts as half a win for each side (the BT fit's convention). If `ci_lo`/`ci_hi` are
     provided (BT bootstrap), they're carried through as elo_lo / elo_hi.
+    `role_ci` (model -> {"elo_w_lo", "elo_w_hi", "elo_v_lo", "elo_v_hi"}) adds
+    the alt/main intervals from the same bootstrap; they stay in the stats
+    rows and are not written to the CSV.
     """
     model_list = list(models)
     elo_d = _as_dict(elo, model_list)
@@ -360,6 +446,8 @@ def _build_stats(
         if lo_d is not None and hi_d is not None:
             row["elo_lo"] = lo_d[m]
             row["elo_hi"] = hi_d[m]
+        if role_ci is not None and m in role_ci:
+            row.update(role_ci[m])
         stats.append(row)
     return stats
 
@@ -450,7 +538,7 @@ def generate_single_table_html(
                     <th>Model</th>
                     <th>Elo</th>
                     {split_headers}
-                    <th>Win Rate</th>
+                    <th>Win Rate (tie = ½)</th>
                     <th style="text-align: right;">Matches</th>
                 </tr>
             </thead>
@@ -518,7 +606,7 @@ def generate_cooperative_table_html(title: str, stats: list[dict[str, Any]]) -> 
                 <tr>
                     <th>Rank</th>
                     <th>Model</th>
-                    <th>Win Rate</th>
+                    <th>Win Rate (tie = ½)</th>
                     <th style="text-align: right;">Matches</th>
                 </tr>
             </thead>
@@ -633,7 +721,7 @@ def generate_html_report(
                 <li><strong>Elo:</strong> Rating computed from pairwise comparisons within each game category.</li>
                 <li><strong>Elo-Alt:</strong> Rating as the minority/hidden role (Werewolf, Spy, Undercover).</li>
                 <li><strong>Elo-Main:</strong> Rating as the majority role (Villager, Non-Spy, Civilian).</li>
-                <li><strong>Win Rate:</strong> Fraction of pairwise comparisons won (~50% expected for equal competition).</li>
+                <li><strong>Win Rate (tie = ½):</strong> Fraction of pairwise comparisons won, a tie counting as half a win for each side, as in the Elo fit (~50% expected for equal competition).</li>
                 <li>Cooperative games (Battle of the Sexes, Stag Hunt) are excluded from the competitive Elo.</li>
             </ul>
         </div>
@@ -654,16 +742,12 @@ def process_logs(log_files: list[str]) -> list[dict[str, Any]]:
     Runs ELO_EPOCHS shuffled passes over the data. The result is order-dependent
     and noisy when ELO_EPOCHS=1 — use `process_logs_bt` for a stable estimate.
     """
-    parsed: list[ParsedEpisode] = []
-    for f in log_files:
-        ep = _parse_episode(f)
-        if ep is not None:
-            parsed.append(ep)
+    parsed = _load_rated_episodes(log_files)
 
     elo_overall: dict[str, float] = defaultdict(lambda: STARTING_ELO)
     elo_alt: dict[str, float] = defaultdict(lambda: STARTING_ELO)
     elo_main: dict[str, float] = defaultdict(lambda: STARTING_ELO)
-    wins: dict[str, int] = defaultdict(int)
+    wins: dict[str, float] = defaultdict(float)
     total_pairwise: dict[str, int] = defaultdict(int)
     episodes_played: dict[str, int] = defaultdict(int)
 
@@ -687,6 +771,11 @@ def process_logs(log_files: list[str]) -> list[dict[str, Any]]:
                 r1 = ep.agent_rewards[a1]
                 r2 = ep.agent_rewards[a2]
                 if r1 == r2:
+                    if first_epoch:  # Win Rate counts a tie as half a win for each side
+                        total_pairwise[m1] += 1
+                        total_pairwise[m2] += 1
+                        wins[m1] += 0.5
+                        wins[m2] += 0.5
                     continue  # ties carry no signal in online ELO
 
                 s1 = 1.0 if r1 > r2 else 0.0
@@ -712,18 +801,76 @@ def process_logs(log_files: list[str]) -> list[dict[str, Any]]:
     )
 
 
-def process_logs_bt(log_files: list[str]) -> list[dict[str, Any]]:
+def _load_rated_episodes(log_files: list[str]) -> list[ParsedEpisode]:
+    """Parse the logs, leaving out malformed ones, episodes with an unrecovered request failure, and all but
+    the latest clean log of a roster that has several (experiments.utils.rated_logs); the counts are printed."""
+    parsed: list[ParsedEpisode] = []
+    skipped: list[str] = []
+    duplicates: list[str] = []
+    for f in rated_logs(log_files, failed=skipped, duplicates=duplicates):
+        ep = _parse_episode(f, skipped=skipped)
+        if ep is not None:
+            parsed.append(ep)
+    if skipped:
+        print(
+            f"  skipped {len(skipped)} episode(s) with an unrecovered request failure "
+            f"(of {len(log_files)} logs)"
+        )
+    if duplicates:
+        print(f"  left out {len(duplicates)} older clean log(s) of a roster rated from its latest log")
+    return parsed
+
+
+def _episode_pair_counts(ep: ParsedEpisode) -> tuple[EpisodeCounts, EpisodeCounts]:
+    """One episode's cross-model outcomes: (wins, ties) by model and, for cross-team pairs of a team
+    game, (wins, ties) by (model, "alt"|"main"). Same-model pairs are skipped; ties are keyed under a
+    canonical (sorted) order."""
+    wins: Dict[tuple, int] = defaultdict(int)
+    ties: Dict[tuple, int] = defaultdict(int)
+    role_wins: Dict[tuple, int] = defaultdict(int)
+    role_ties: Dict[tuple, int] = defaultdict(int)
+    for a1, a2, team_pair in ep.pairs:
+        m1 = ep.model_mapping[a1]
+        m2 = ep.model_mapping[a2]
+        if m1 == m2:
+            continue
+        r1 = ep.agent_rewards[a1]
+        r2 = ep.agent_rewards[a2]
+        if r1 > r2:
+            wins[(m1, m2)] += 1
+            if team_pair:
+                role_wins[((m1, "alt"), (m2, "main"))] += 1
+        elif r2 > r1:
+            wins[(m2, m1)] += 1
+            if team_pair:
+                role_wins[((m2, "main"), (m1, "alt"))] += 1
+        else:
+            ties[tuple(sorted((m1, m2)))] += 1
+            if team_pair:
+                role_ties[tuple(sorted(((m1, "alt"), (m2, "main"))))] += 1
+    return (dict(wins), dict(ties)), (dict(role_wins), dict(role_ties))
+
+
+def process_logs_bt(
+    log_files: list[str],
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+    bootstrap: str = DEFAULT_BOOTSTRAP,
+) -> list[dict[str, Any]]:
     """Compute Chatbot Arena-style BT ratings (L2-regularized logistic regression).
 
     Aggregates pairwise win + tie counts across all episodes, then fits
-    `compute_mle_elo` once per rating scope (overall, alt-role, main-role).
-    Order-independent and stable; the recommended method for offline analysis.
+    `compute_mle_elo` once per rating scope (overall, and one joint fit over
+    (model, alt|main) identities for the role ratings). A tie counts as half a
+    win for each side. The 95% intervals come from `n_bootstrap` bootstrap
+    draws (`bootstrap_mle_elo`). By default (bootstrap="pair") each draw is a
+    multinomial resample of the battles over the win and tie cells, as in
+    FastChat; bootstrap="episode" resamples whole episodes instead, the same
+    episodes for the overall and the role fit. Episodes with an unrecovered
+    request failure are left out. Order-independent and stable; the
+    recommended method for offline analysis.
     """
-    parsed: list[ParsedEpisode] = []
-    for f in log_files:
-        ep = _parse_episode(f)
-        if ep is not None:
-            parsed.append(ep)
+    parsed = _load_rated_episodes(log_files)
 
     overall_wins: Dict[tuple, int] = defaultdict(int)
     overall_ties: Dict[tuple, int] = defaultdict(int)
@@ -732,8 +879,10 @@ def process_logs_bt(log_files: list[str]) -> list[dict[str, Any]]:
     # on each side are properly fit by a single shared BT model.
     role_wins: Dict[tuple, int] = defaultdict(int)
     role_ties: Dict[tuple, int] = defaultdict(int)
+    per_episode: list[EpisodeCounts] = []
+    per_episode_role: list[EpisodeCounts] = []
 
-    wins: Dict[str, int] = defaultdict(int)
+    wins: Dict[str, float] = defaultdict(float)  # Win Rate numerator: a tie is half a win for each side
     total_pairwise: Dict[str, int] = defaultdict(int)
     episodes_played: Dict[str, int] = defaultdict(int)
     all_models: set[str] = set()
@@ -743,49 +892,62 @@ def process_logs_bt(log_files: list[str]) -> list[dict[str, Any]]:
             episodes_played[m] += 1
             all_models.add(m)
 
-        for a1, a2, team_pair in ep.pairs:
-            m1 = ep.model_mapping[a1]
-            m2 = ep.model_mapping[a2]
-            if m1 == m2:
-                continue
-            r1 = ep.agent_rewards[a1]
-            r2 = ep.agent_rewards[a2]
-            total_pairwise[m1] += 1
-            total_pairwise[m2] += 1
-
-            if r1 > r2:
-                overall_wins[(m1, m2)] += 1
-                wins[m1] += 1
-                if team_pair:
-                    role_wins[((m1, "alt"), (m2, "main"))] += 1
-            elif r2 > r1:
-                overall_wins[(m2, m1)] += 1
-                wins[m2] += 1
-                if team_pair:
-                    role_wins[((m2, "main"), (m1, "alt"))] += 1
-            else:
-                # Tie: record under a canonical ordering so we don't double-count.
-                a, b = sorted((m1, m2))
-                overall_ties[(a, b)] += 1
-                if team_pair:
-                    pa = (m1, "alt")
-                    pb = (m2, "main")
-                    ra, rb = sorted((pa, pb))
-                    role_ties[(ra, rb)] += 1
+        (ew, et), (rw, rt) = _episode_pair_counts(ep)
+        per_episode.append((ew, et))
+        per_episode_role.append((rw, rt))
+        for (w, l), c in ew.items():
+            overall_wins[(w, l)] += c
+            wins[w] += c
+            total_pairwise[w] += c
+            total_pairwise[l] += c
+        for (a, b), c in et.items():
+            overall_ties[(a, b)] += c
+            wins[a] += 0.5 * c
+            wins[b] += 0.5 * c
+            total_pairwise[a] += c
+            total_pairwise[b] += c
+        for k, c in rw.items():
+            role_wins[k] += c
+        for k, c in rt.items():
+            role_ties[k] += c
 
     if not all_models:
         return []
 
     models = sorted(all_models)
-    n = len(models)
-    overall_elo, ci_lo, ci_hi = bootstrap_mle_elo(overall_wins, overall_ties, models)
+    overall_elo, ci_lo, ci_hi = bootstrap_mle_elo(
+        overall_wins,
+        overall_ties,
+        models,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        bootstrap=bootstrap,
+        episodes=per_episode,
+    )
 
     # Single BT fit over (model, role) identities so alt and main ratings
-    # share a scale and properly use both wins and losses on each side.
-    role_players = sorted({p for k in role_wins for p in k} | {p for k in role_ties for p in k})
+    # share a scale and properly use both wins and losses on each side. Its
+    # intervals use the same bootstrap unit and seed as the overall ones
+    # above (with the episode bootstrap, the same resampled episodes).
+    role_players = sorted(
+        {p for k in role_wins for p in k} | {p for k in role_ties for p in k}
+    )
+    role_ci: Dict[str, Dict[str, float]] = {}
     if role_players:
-        role_elo_arr = compute_mle_elo(role_wins, role_ties, role_players)
+        role_elo_arr, role_lo, role_hi = bootstrap_mle_elo(
+            role_wins,
+            role_ties,
+            role_players,
+            n_bootstrap=n_bootstrap,
+            seed=seed,
+            bootstrap=bootstrap,
+            episodes=per_episode_role,
+        )
         role_elo = {rp: float(e) for rp, e in zip(role_players, role_elo_arr)}
+        for rp, lo, hi in zip(role_players, role_lo, role_hi):
+            side = "w" if rp[1] == "alt" else "v"
+            role_ci.setdefault(rp[0], {})[f"elo_{side}_lo"] = float(lo)
+            role_ci[rp[0]][f"elo_{side}_hi"] = float(hi)
     else:
         role_elo = {}
     alt_elo_dict: Dict[str, float] = {
@@ -805,17 +967,22 @@ def process_logs_bt(log_files: list[str]) -> list[dict[str, Any]]:
         episodes_played,
         ci_lo=ci_lo,
         ci_hi=ci_hi,
+        role_ci=role_ci or None,
     )
 
 
-def save_to_csv(title: str, stats: list[dict[str, Any]], method: str = "bt") -> None:
+def save_to_csv(
+    title: str, stats: list[dict[str, Any]], method: str = "bt", out_dir: str = "experiments"
+) -> None:
     """Saves the stats list to a CSV file. method='bt' prefixes the filename
     and adds ELO_lo / ELO_hi columns (95% bootstrap CI) when available."""
     safe_title = title.lower().replace(" ", "_").replace("/", "_")
     prefix = "elo_results_bt_" if method == "bt" else "elo_results_"
-    filename = os.path.join("experiments", f"{prefix}{safe_title}.csv")
+    os.makedirs(out_dir, exist_ok=True)
+    filename = os.path.join(out_dir, f"{prefix}{safe_title}.csv")
 
     has_ci = bool(stats) and "elo_lo" in stats[0]
+    # "Win Rate" counts a tie as half a win for each side (the HTML header says so).
     headers = ["Rank", "Model", "Elo"]
     if has_ci:
         headers += ["Elo_lo", "Elo_hi"]
@@ -843,18 +1010,36 @@ def save_to_csv(title: str, stats: list[dict[str, Any]], method: str = "bt") -> 
     print(f"Generated CSV: {filename}")
 
 
-def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
+def calculate_elo(
+    log_dir: str = "logs/tournament",
+    method: str = "bt",
+    out_dir: str = "experiments",
+    bootstrap: str = DEFAULT_BOOTSTRAP,
+) -> None:
     """Compute ratings from a directory of episode logs.
 
     method='bt' (default): Bradley-Terry MLE via L2-regularized logistic
         regression (Chatbot Arena style). Closed-form, order-independent,
-        stable; reports 95% bootstrap CIs.
+        stable; reports 95% bootstrap CIs. bootstrap='pair' (default)
+        resamples battles over the win and tie cells, as FastChat does;
+        bootstrap='episode' resamples whole episodes.
     method='online': online Elo with K_FACTOR step and ELO_EPOCHS shuffled
         passes. Order-dependent; kept for backwards comparison only.
+
+    Episodes with an unrecovered request-level failure are skipped and
+    counted, and a roster with several clean logs is rated from its latest
+    one (experiments.utils.rated_logs). A log of a rule variant
+    (metadata.variant, e.g. the no-discussion communication control) is
+    never rated. CSVs and the HTML leaderboard are written to `out_dir`.
     """
     assert method in ("online", "bt"), f"unknown method: {method}"
-    proc = process_logs_bt if method == "bt" else process_logs
-    print(f"Calculating ratings ({method}) from logs in: {log_dir}")
+    assert bootstrap in BOOTSTRAP_UNITS, f"unknown bootstrap unit: {bootstrap}"
+    if method == "bt":
+        proc = functools.partial(process_logs_bt, bootstrap=bootstrap)
+        print(f"Calculating ratings (bt, {bootstrap} bootstrap) from logs in: {log_dir}")
+    else:
+        proc = process_logs
+        print(f"Calculating ratings ({method}) from logs in: {log_dir}")
 
     log_files = glob.glob(os.path.join(log_dir, "**", "*.json"), recursive=True)
     print(f"Found {len(log_files)} items")
@@ -862,6 +1047,9 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
     # 1. Group logs by game, splitting competitive vs cooperative
     competitive_by_game: Dict[str, list[str]] = defaultdict(list)
     cooperative_by_game: Dict[str, list[str]] = defaultdict(list)
+    failed_by_game: Dict[str, int] = defaultdict(int)
+    variant_logs: Dict[str, int] = defaultdict(int)
+    no_game: list[str] = []
 
     for filepath in log_files:
         try:
@@ -869,6 +1057,20 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
                 data = json.load(f)
             metadata = data.get("metadata", {})
             game_name = metadata.get("game_name", "Unknown")
+            if metadata.get("variant"):
+                # A rule variant is another game; left out before the one-log-per-roster selection, so a
+                # variant log of a leaderboard roster can never stand in for the roster's own log.
+                variant_logs[str(metadata["variant"])] += 1
+                continue
+            if unrecovered_request_failures(data):
+                # A model call failed at the request level and was played as 'none'; the
+                # runner replays the roster on resume, so the episode is not rated.
+                failed_by_game[game_name] += 1
+                continue
+            if not metadata.get("game_name"):
+                # No per-game table can show it, so it is left out of the overall tables too.
+                no_game.append(filepath)
+                continue
             bucket = (
                 cooperative_by_game
                 if game_name in COOPERATIVE_GAMES
@@ -877,6 +1079,31 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
             bucket[game_name].append(filepath)
         except Exception:
             continue
+    if no_game:
+        print(f"Left out {len(no_game)} log(s) without metadata.game_name (no table can show them)")
+    if variant_logs:
+        print(
+            f"Left out {sum(variant_logs.values())} log(s) of a rule variant ("
+            + ", ".join(f"{v} {n}" for v, n in sorted(variant_logs.items()))
+            + ")"
+        )
+
+    n_failed = sum(failed_by_game.values())
+    print(
+        f"Skipped {n_failed} episode(s) with an unrecovered request failure"
+        + (
+            ": " + ", ".join(f"{g} {n}" for g, n in sorted(failed_by_game.items()))
+            if n_failed
+            else ""
+        )
+    )
+    duplicates: list[str] = []
+    rated_logs([f for files in competitive_by_game.values() for f in files]
+               + [f for files in cooperative_by_game.values() for f in files], duplicates=duplicates)
+    print(
+        f"Left out {len(duplicates)} older clean log(s) of a roster that has a later clean log "
+        f"(one log is rated per roster)"
+    )
 
     competitive_logs = [f for files in competitive_by_game.values() for f in files]
     cooperative_logs = [f for files in cooperative_by_game.values() for f in files]
@@ -887,7 +1114,10 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
     print("Processing Competitive Overall...")
     competitive_tables["Competitive Overall"] = proc(competitive_logs)
     save_to_csv(
-        "Competitive Overall", competitive_tables["Competitive Overall"], method=method
+        "Competitive Overall",
+        competitive_tables["Competitive Overall"],
+        method=method,
+        out_dir=out_dir,
     )
 
     for game_name, game_logs in sorted(competitive_by_game.items()):
@@ -897,7 +1127,7 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
         title = game_name.replace("_", " ").title()
         stats = proc(game_logs)
         competitive_tables[title] = stats
-        save_to_csv(title, stats, method=method)
+        save_to_csv(title, stats, method=method, out_dir=out_dir)
 
     # 3. Cooperative tables
     cooperative_tables: Dict[str, list[dict[str, Any]]] = {}
@@ -909,6 +1139,7 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
             "Cooperative Overall",
             cooperative_tables["Cooperative Overall"],
             method=method,
+            out_dir=out_dir,
         )
 
         for game_name, game_logs in sorted(cooperative_by_game.items()):
@@ -916,12 +1147,12 @@ def calculate_elo(log_dir: str = "logs/tournament", method: str = "bt") -> None:
             title = game_name.replace("_", " ").title()
             stats = proc(game_logs)
             cooperative_tables[title] = stats
-            save_to_csv(title, stats, method=method)
+            save_to_csv(title, stats, method=method, out_dir=out_dir)
 
     # 4. Generate HTML
     html_content = generate_html_report(competitive_tables, cooperative_tables)
     html_name = "elo_leaderboard_bt.html" if method == "bt" else "elo_leaderboard.html"
-    output_html = os.path.join("experiments", html_name)
+    output_html = os.path.join(out_dir, html_name)
     with open(output_html, "w") as f:
         f.write(html_content)
 
@@ -945,5 +1176,19 @@ if __name__ == "__main__":
         default="bt",
         help="Rating method: 'bt' = Bradley-Terry MLE (default, recommended), 'online' = online Elo updates.",
     )
+    parser.add_argument(
+        "--out-dir",
+        default="experiments",
+        help="Directory for the CSVs and the HTML leaderboard (default: experiments).",
+    )
+    parser.add_argument(
+        "--bootstrap",
+        choices=BOOTSTRAP_UNITS,
+        default=DEFAULT_BOOTSTRAP,
+        help="Resampling unit of the 95%% CIs (bt only): 'pair' = battles, a multinomial over the win and tie "
+        "cells as in FastChat (default); 'episode' = whole episodes.",
+    )
     args = parser.parse_args()
-    calculate_elo(log_dir=args.log_dir, method=args.method)
+    calculate_elo(
+        log_dir=args.log_dir, method=args.method, out_dir=args.out_dir, bootstrap=args.bootstrap
+    )
